@@ -197,6 +197,30 @@ def distribute(config: str = 'config.yaml'):
         finally: n.close()
 
 
+@app.command('downgrade-leads')
+def downgrade_leads(config: str = 'config.yaml'):
+    """Run staleness-based lead demotion — downgrade stale leads to lower priority types."""
+    s = load_settings(config); tracker = MlflowTracker(s); banner('LEAD DOWNGRADE ENGINE')
+    with tracker.run('downgrade-leads', run_params(s)):
+        n = neo(s)
+        try:
+            from app.engines.downgrade_engine import DowngradeEngine
+            DowngradeEngine(n, s).run()
+        finally: n.close()
+
+
+@app.command('update-seller-stats')
+def update_seller_stats(config: str = 'config.yaml'):
+    """Recompute win_rate and avg_response_h on all Seller nodes (run daily)."""
+    s = load_settings(config); banner('UPDATE SELLER STATS')
+    n = neo(s)
+    try:
+        from app.engines.seller_ranking_engine import SellerRankingEngine
+        SellerRankingEngine(n, s).update_seller_stats()
+        ok('Seller stats updated')
+    finally: n.close()
+
+
 @app.command('process-feedback')
 def process_feedback(config: str = 'config.yaml'):
     """Run seller feedback threshold auto-tuning."""

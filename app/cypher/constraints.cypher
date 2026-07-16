@@ -7,3 +7,4 @@ CREATE CONSTRAINT opportunity_hypothesis_id_v25 IF NOT EXISTS FOR (n:Opportunity
 CREATE CONSTRAINT fit_suppression_uid_v25 IF NOT EXISTS FOR (n:FitSuppression) REQUIRE n.fit_suppression_uid IS UNIQUE;
 CREATE CONSTRAINT lead_classification_uid_v25 IF NOT EXISTS FOR (n:LeadClassification) REQUIRE n.classification_uid IS UNIQUE;
 CREATE CONSTRAINT lead_uid_v25 IF NOT EXISTS FOR (n:Lead) REQUIRE n.lead_uid IS UNIQUE;
+CREATE CONSTRAINT lead_state_history_uid IF NOT EXISTS FOR (n:LeadStateHistory) REQUIRE n.history_uid IS UNIQUE;

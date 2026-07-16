@@ -12,3 +12,9 @@ CREATE INDEX deal_signal_created_v25_idx IF NOT EXISTS FOR (n:Deal) ON (n.v25_si
 CREATE INDEX fit_model_v25_idx IF NOT EXISTS FOR (fs:FitSuppression) ON (fs.scoring_model_version);
 CREATE INDEX lc_model_v25_idx IF NOT EXISTS FOR (lc:LeadClassification) ON (lc.scoring_model_version);
 CREATE INDEX lead_post_v25_idx IF NOT EXISTS FOR (l:Lead) ON (l.v25_post_processed);
+CREATE INDEX lead_state_history_lead_uid IF NOT EXISTS FOR (n:LeadStateHistory) ON (n.lead_uid);
+CREATE INDEX lead_state_history_transitioned_at IF NOT EXISTS FOR (n:LeadStateHistory) ON (n.transitioned_at);
+CREATE INDEX lead_playbook_tags IF NOT EXISTS FOR (n:Lead) ON (n.playbook_tags);
+CREATE INDEX lead_last_transition IF NOT EXISTS FOR (n:Lead) ON (n.last_transition_at);
+CREATE INDEX lead_suppressed IF NOT EXISTS FOR (n:Lead) ON (n.suppressed);
+CREATE INDEX lead_previous_type IF NOT EXISTS FOR (n:Lead) ON (n.previous_lead_type);

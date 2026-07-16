@@ -122,10 +122,134 @@ class KafkaEventConsumer:
         record_click_signal(self.neo, payload)
 
     def handle_lead_update(self, payload: dict):
-        """Lead status changed in CRM → reclassify."""
-        logger.info(f'handle_lead_update: lead_id={payload.get("lead_id")}')
-        from app.features.lead_classifier import reclassify_lead
-        reclassify_lead(self.neo, payload)
+        """Lead status changed in CRM → reclassify. Routes by source table."""
+        source_table = payload.get("_source_table", "crm.crm_leads")
+        logger.info(f'handle_lead_update: table={source_table} id={payload.get("id")}')
+
+        if source_table == "crm.deals":
+            self._handle_deal(payload)
+        elif source_table == "crm.account_risk_flags":
+            self._handle_risk_flag(payload)
+        elif source_table in ("crm.crm_emails", "crm.auto_quote_email_events"):
+            self._handle_email_event(payload)
+        else:
+            from app.features.lead_classifier import reclassify_lead
+            reclassify_lead(self.neo, payload)
+
+    def _handle_deal(self, payload: dict):
+        """New/updated deal → create or update engaged_account or reactivation_candidate lead."""
+        deal_id = str(payload.get("id") or "")
+        if not deal_id:
+            return
+        amount = float(payload.get("amount") or 0)
+        deal_name = (payload.get("deal_name") or "")[:200]
+        src = f"deal:{deal_id}"
+        # If the deal is being updated and is old → reactivation_candidate
+        # If it's new → engaged_account
+        lead_type = "engaged_account"
+        score = 70
+
+        self.neo.run("""
+            MERGE (l:Lead {source_ref: $src})
+            ON CREATE SET
+                l.lead_uid         = 'classified:' + $lt + ':' + $src,
+                l.lead_type        = $lt,
+                l.score_final      = $score,
+                l.visibility_level = 'priority',
+                l.source           = 'goglo_crm',
+                l.source_ref       = $src,
+                l.synced_from_sql  = true,
+                l.deal_name        = $deal_name,
+                l.deal_amount      = $amount,
+                l.playbook_tags    = ['account_warming', 'contact_qualification'],
+                l.classified_at    = $now,
+                l.created_at       = $now
+            ON MATCH SET
+                l.lead_type    = $lt,
+                l.score_final  = $score,
+                l.classified_at = $now
+        """, {"lt": lead_type, "score": score, "src": src,
+              "deal_name": deal_name, "amount": amount,
+              "now": datetime.now(timezone.utc).isoformat()})
+        logger.info(f'_handle_deal: upserted Lead {src} as {lead_type}')
+
+    def _handle_risk_flag(self, payload: dict):
+        """Account risk flag → suppress any matching leads from routing."""
+        account_uid = str(payload.get("account_uid") or "")
+        risk_type   = str(payload.get("risk_type") or "unknown")
+        flag_id     = str(payload.get("id") or "")
+        if not account_uid and not flag_id:
+            return
+
+        src = f"risk_flag:{flag_id}"
+        # Create a suppressed_noise lead for this risk flag
+        self.neo.run("""
+            MERGE (l:Lead {source_ref: $src})
+            ON CREATE SET
+                l.lead_uid          = 'classified:suppressed_noise:' + $src,
+                l.lead_type         = 'suppressed_noise',
+                l.score_final       = 10,
+                l.visibility_level  = 'count_only',
+                l.source            = 'crm_risk',
+                l.source_ref        = $src,
+                l.synced_from_sql   = true,
+                l.account_uid       = $account_uid,
+                l.suppressed        = true,
+                l.suppression_reason = $risk_type,
+                l.distribution_status = 'suppressed',
+                l.seller_visible    = false,
+                l.classified_at     = $now,
+                l.created_at        = $now
+        """, {"src": src, "account_uid": account_uid,
+              "risk_type": risk_type,
+              "now": datetime.now(timezone.utc).isoformat()})
+
+        # Also suppress any existing leads for this account
+        if account_uid:
+            self.neo.run("""
+                MATCH (l:Lead)
+                WHERE l.account_uid = $account_uid
+                  AND l.lead_type <> 'suppressed_noise'
+                  AND coalesce(l.suppressed, false) = false
+                SET l.suppressed        = true,
+                    l.suppression_reason = $risk_type,
+                    l.distribution_status = 'suppressed',
+                    l.seller_visible    = false
+            """, {"account_uid": account_uid, "risk_type": risk_type})
+        logger.info(f'_handle_risk_flag: suppressed account {account_uid} ({risk_type})')
+
+    def _handle_email_event(self, payload: dict):
+        """Email open/click → update engagement score on related Lead."""
+        source_table = payload.get("_source_table", "")
+        event_type   = str(payload.get("event_type") or payload.get("status") or "")
+        account_id   = str(payload.get("account_id") or payload.get("auto_quote_email_id") or "")
+
+        if not account_id:
+            return
+
+        # Boost score for opens/clicks, penalise bounces
+        if event_type in ("open", "opened", "click", "clicked"):
+            score_delta = 5
+        elif event_type in ("bounce", "bounced", "spam", "unsubscribed"):
+            score_delta = -10
+        else:
+            return
+
+        self.neo.run("""
+            MATCH (l:Lead)
+            WHERE l.account_id = $account_id
+              OR l.contact_id = $account_id
+            SET l.score_final = CASE
+                WHEN l.score_final + $delta < 10  THEN 10
+                WHEN l.score_final + $delta > 100 THEN 100
+                ELSE l.score_final + $delta
+            END,
+            l.last_email_event = $event_type,
+            l.classified_at    = $now
+        """, {"account_id": account_id, "delta": score_delta,
+              "event_type": event_type,
+              "now": datetime.now(timezone.utc).isoformat()})
+        logger.info(f'_handle_email_event: score {score_delta:+d} for account {account_id} ({event_type})')
 
     def _noop(self, payload: dict):
         logger.warning(f'KafkaEventConsumer: no handler for payload: {payload}')

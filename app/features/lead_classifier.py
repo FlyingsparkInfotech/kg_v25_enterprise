@@ -36,6 +36,10 @@ SCORES = {
     "strategic_account_watch":      65,
     "competitor_displacement":      80,
     "known_person_interest":        70,
+    "reactivation_candidate":    72,
+    "partner_chain_opportunity": 68,
+    "suppressed_noise":          10,
+    "active_exporter":           60,
 }
 
 VISIBILITY = {
@@ -61,6 +65,32 @@ VISIBILITY = {
     "anonymous_account_visit":      "watchlist",
     # count_only — aggregated stats only; not shown to sellers
     "visit_only":                   "count_only",
+    "reactivation_candidate":    "push_notify",
+    "partner_chain_opportunity": "feed",
+    "suppressed_noise":          "count_only",
+    "active_exporter":           "feed",
+}
+
+
+PLAYBOOK_TAGS = {
+    "rfq_submitted":             ["rfq_respond_now", "procurement_response"],
+    "quote_ready":               ["rfq_respond_now", "commercial_path"],
+    "hot_in_market":             ["high_intent_abandonment", "account_warming"],
+    "competitor_displacement":   ["champion_reengagement", "commercial_path"],
+    "engaged_person":            ["contact_qualification", "buying_committee_velocity"],
+    "engaged_account":           ["account_warming", "contact_qualification"],
+    "known_person_interest":     ["contact_qualification", "outbound_trade"],
+    "known_account_interest":    ["account_warming"],
+    "active_importer":           ["outbound_trade", "procurement_response"],
+    "trade_buyer_candidate":     ["supply_chain_resilience", "outbound_trade"],
+    "intent_only":               ["account_warming", "high_intent_abandonment"],
+    "strategic_account_watch":   ["strategic_consolidation", "ecosystem_play"],
+    "reactivation_candidate":    ["champion_reengagement", "contact_moved_to_new_company"],
+    "partner_chain_opportunity": ["ecosystem_play", "cross_sell"],
+    "active_exporter":           ["ecosystem_play", "strategic_consolidation"],
+    "visit_only":                [],
+    "anonymous_account_visit":   [],
+    "suppressed_noise":          [],
 }
 
 
@@ -879,6 +909,269 @@ def _create_strategic_account_watch_leads(neo: Neo4jClient) -> int:
     return rows[0]["c"] if rows else 0
 
 
+# ─── 10. reactivation_candidate: re-engaged closed deals ─────────────────────
+def _create_reactivation_candidates(neo: Neo4jClient, settings) -> int:
+    import pymysql
+    import pymysql.cursors
+    cfg = settings.mysql_crm
+    conn = pymysql.connect(
+        host=cfg.host, port=cfg.port, user=cfg.user, password=cfg.password,
+        charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, deal_name, deal_owner, contact_id, amount,
+                       deal_creation_source, created_at, updated_at
+                FROM crm.deals
+                WHERE updated_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
+                  AND created_at < DATE_SUB(NOW(), INTERVAL 90 DAY)
+            """)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return 0
+
+    batch = []
+    for r in rows:
+        src = f"deal:{r['id']}"
+        batch.append({
+            "lead_uid":        f"classified:reactivation_candidate:{src}",
+            "lead_type":       "reactivation_candidate",
+            "score_final":     72,
+            "visibility_level": "push_notify",
+            "source":          "goglo_crm",
+            "source_ref":      src,
+            "deal_name":       (r.get("deal_name") or "")[:200],
+            "deal_owner":      str(r.get("deal_owner") or ""),
+            "contact_id":      str(r.get("contact_id") or ""),
+            "deal_amount":     float(r.get("amount") or 0),
+            "playbook_tags":   ["champion_reengagement", "contact_moved_to_new_company"],
+        })
+
+    neo.run("""
+        UNWIND $rows AS row
+        MERGE (l:Lead {lead_uid: row.lead_uid})
+        ON CREATE SET
+            l.lead_type        = row.lead_type,
+            l.score_final      = row.score_final,
+            l.visibility_level = row.visibility_level,
+            l.source           = row.source,
+            l.source_ref       = row.source_ref,
+            l.synced_from_sql  = true,
+            l.deal_name        = row.deal_name,
+            l.deal_owner       = row.deal_owner,
+            l.contact_id       = row.contact_id,
+            l.deal_amount      = row.deal_amount,
+            l.playbook_tags    = row.playbook_tags,
+            l.classified_at    = $now
+    """, {"rows": batch, "now": _now()})
+    return len(batch)
+
+
+# ─── 11. partner_chain_opportunity: resellers / distributors ─────────────────
+def _create_partner_chain_opportunities(neo: Neo4jClient, settings) -> int:
+    import pymysql
+    import pymysql.cursors
+    cfg = settings.mysql_crm
+    conn = pymysql.connect(
+        host=cfg.host, port=cfg.port, user=cfg.user, password=cfg.password,
+        charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, enquiry_user_id, seller_user_id, product_id,
+                       purpose_of_inquiry, message, country, created_at
+                FROM goglo_staging.enquiries
+                WHERE deleted_at IS NULL
+                  AND (
+                    LOWER(COALESCE(purpose_of_inquiry,'')) LIKE '%resell%'
+                    OR LOWER(COALESCE(purpose_of_inquiry,'')) LIKE '%distribut%'
+                    OR LOWER(COALESCE(purpose_of_inquiry,'')) LIKE '%wholesale%'
+                    OR LOWER(COALESCE(message,'')) LIKE '%resell%'
+                    OR LOWER(COALESCE(message,'')) LIKE '%distribut%'
+                    OR LOWER(COALESCE(message,'')) LIKE '%wholesale%'
+                  )
+            """)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return 0
+
+    batch = []
+    for r in rows:
+        purpose = (r.get("purpose_of_inquiry") or "").lower()
+        msg = (r.get("message") or "").lower()
+        if "distribut" in purpose or "distribut" in msg:
+            partner_type = "distributor"
+        elif "wholesale" in purpose or "wholesale" in msg:
+            partner_type = "wholesaler"
+        else:
+            partner_type = "reseller"
+
+        src = f"enquiry_partner:{r['id']}"
+        batch.append({
+            "lead_uid":        f"classified:partner_chain_opportunity:{src}",
+            "lead_type":       "partner_chain_opportunity",
+            "score_final":     68,
+            "visibility_level": "feed",
+            "source":          "goglo_crm2",
+            "source_ref":      src,
+            "buyer_user_id":   str(r.get("enquiry_user_id") or ""),
+            "seller_user_id":  str(r.get("seller_user_id") or ""),
+            "product_id":      str(r.get("product_id") or ""),
+            "partner_type":    partner_type,
+            "buyer_country":   r.get("country") or "",
+            "playbook_tags":   ["ecosystem_play", "cross_sell"],
+        })
+
+    neo.run("""
+        UNWIND $rows AS row
+        MERGE (l:Lead {lead_uid: row.lead_uid})
+        ON CREATE SET
+            l.lead_type        = row.lead_type,
+            l.score_final      = row.score_final,
+            l.visibility_level = row.visibility_level,
+            l.source           = row.source,
+            l.source_ref       = row.source_ref,
+            l.synced_from_sql  = true,
+            l.buyer_user_id    = row.buyer_user_id,
+            l.seller_user_id   = row.seller_user_id,
+            l.product_id       = row.product_id,
+            l.partner_type     = row.partner_type,
+            l.buyer_country    = row.buyer_country,
+            l.playbook_tags    = row.playbook_tags,
+            l.classified_at    = $now
+    """, {"rows": batch, "now": _now()})
+    return len(batch)
+
+
+# ─── 12. suppressed_noise: risk flags → suppress from seller routing ──────────
+def _create_suppressed_noise_leads(neo: Neo4jClient, settings) -> int:
+    import pymysql
+    import pymysql.cursors
+    cfg = settings.mysql_crm
+    conn = pymysql.connect(
+        host=cfg.host, port=cfg.port, user=cfg.user, password=cfg.password,
+        charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, account_uid, risk_type, severity, source, reference_id, created_at
+                FROM crm.account_risk_flags
+                WHERE risk_type IN (
+                    'bot', 'spam', 'fake_rfq', 'duplicate',
+                    'tracking_anomaly', 'compliance_risk', 'do_not_contact'
+                )
+            """)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return 0
+
+    batch = []
+    for r in rows:
+        src = f"risk_flag:{r['id']}"
+        batch.append({
+            "lead_uid":          f"classified:suppressed_noise:{src}",
+            "lead_type":         "suppressed_noise",
+            "score_final":       10,
+            "visibility_level":  "count_only",
+            "source":            "crm_risk",
+            "source_ref":        src,
+            "account_uid":       str(r.get("account_uid") or ""),
+            "suppression_reason": r.get("risk_type") or "unknown",
+            "risk_severity":     r.get("severity") or "medium",
+        })
+
+    neo.run("""
+        UNWIND $rows AS row
+        MERGE (l:Lead {lead_uid: row.lead_uid})
+        ON CREATE SET
+            l.lead_type         = row.lead_type,
+            l.score_final       = row.score_final,
+            l.visibility_level  = row.visibility_level,
+            l.source            = row.source,
+            l.source_ref        = row.source_ref,
+            l.synced_from_sql   = true,
+            l.account_uid       = row.account_uid,
+            l.suppressed        = true,
+            l.suppression_reason = row.suppression_reason,
+            l.risk_severity     = row.risk_severity,
+            l.distribution_status = 'suppressed',
+            l.seller_visible    = false,
+            l.classified_at     = $now
+    """, {"rows": batch, "now": _now()})
+    return len(batch)
+
+
+# ─── 13. active_exporter: companies with strong export activity ───────────────
+def _create_active_exporter_leads(neo: Neo4jClient) -> int:
+    rows = neo.run("""
+        MATCH (tr:TradeRelationship)
+        WHERE tr.supplier_org_name IS NOT NULL AND tr.supplier_org_name <> ''
+        WITH tr.supplier_org_name AS org_name,
+             tr.supplier_org_id   AS org_id,
+             count(tr)            AS tr_count,
+             avg(tr.health_score) AS avg_health,
+             sum(tr.shipment_count) AS total_shipments
+        WHERE tr_count >= 3
+        AND NOT EXISTS {
+            MATCH (s:Seller)
+            WHERE s.name = org_name OR s.org_id = org_id
+        }
+        AND NOT EXISTS {
+            MATCH (l:Lead {lead_type: 'active_exporter'})
+            WHERE l.company_name = org_name OR l.buyer_org_id = org_id
+        }
+        WITH org_name, org_id, tr_count, avg_health, total_shipments,
+             'active_exporter:' + coalesce(org_id, org_name) AS src
+        WHERE NOT EXISTS { MATCH (l:Lead {source_ref: src}) }
+        MERGE (l:Lead {lead_uid: 'classified:active_exporter:' + src})
+        ON CREATE SET
+            l.lead_type              = 'active_exporter',
+            l.score_final            = 60,
+            l.visibility_level       = 'feed',
+            l.source                 = 'goglo_trade',
+            l.source_ref             = src,
+            l.synced_from_sql        = true,
+            l.company_name           = org_name,
+            l.buyer_org_id           = org_id,
+            l.trade_relationship_count = tr_count,
+            l.avg_trade_health       = avg_health,
+            l.total_shipments        = total_shipments,
+            l.playbook_tags          = ['ecosystem_play', 'strategic_consolidation'],
+            l.classified_at          = $now
+        RETURN count(l) AS c
+    """, {"now": _now()})
+    return rows[0]["c"] if rows else 0
+
+
+# ─── Playbook tag assignment ──────────────────────────────────────────────────
+def _assign_playbook_tags(neo: Neo4jClient):
+    """Assign playbook_tags to all leads that don't have them yet."""
+    tag_rows = [
+        {"lead_type": lt, "tags": tags}
+        for lt, tags in PLAYBOOK_TAGS.items()
+        if tags  # skip empty tag lists
+    ]
+    if tag_rows:
+        neo.run("""
+            UNWIND $rows AS row
+            MATCH (l:Lead {lead_type: row.lead_type})
+            WHERE l.playbook_tags IS NULL OR size(l.playbook_tags) = 0
+            SET l.playbook_tags = row.tags
+        """, {"rows": tag_rows})
+
+
 # ─── Real-time event handlers (called by KafkaEventConsumer) ─────────────────
 
 def run_single_rfq(neo: Neo4jClient, payload: dict):
@@ -1074,6 +1367,30 @@ def run(config_path: str = "config.yaml") -> dict:
         c = _create_strategic_account_watch_leads(neo)
         results["strategic_account_watch"] = c
         ok(f"  → {c} strategic account watch leads")
+
+        info("Step 13: Creating reactivation_candidate leads (re-engaged closed deals)...")
+        c = _create_reactivation_candidates(neo, settings)
+        results["reactivation_candidate"] = c
+        ok(f"  → {c} reactivation candidates")
+
+        info("Step 14: Creating partner_chain_opportunity leads (resellers/distributors)...")
+        c = _create_partner_chain_opportunities(neo, settings)
+        results["partner_chain_opportunity"] = c
+        ok(f"  → {c} partner chain opportunities")
+
+        info("Step 15: Creating suppressed_noise leads (account risk flags)...")
+        c = _create_suppressed_noise_leads(neo, settings)
+        results["suppressed_noise"] = c
+        ok(f"  → {c} suppressed noise leads flagged")
+
+        info("Step 16: Creating active_exporter leads (trade data)...")
+        c = _create_active_exporter_leads(neo)
+        results["active_exporter"] = c
+        ok(f"  → {c} active exporter leads")
+
+        info("Step 17: Assigning playbook tags...")
+        _assign_playbook_tags(neo)
+        ok("  → playbook tags assigned")
 
         # Final count
         final = neo.run("MATCH (l:Lead) RETURN coalesce(l.lead_type,'null') AS lt, count(l) AS c ORDER BY c DESC")

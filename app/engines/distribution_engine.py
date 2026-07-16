@@ -36,6 +36,8 @@ SET a.seller_id      = row.seller_id,
     a.match_reason   = row.match_reason,
     a.status         = 'assigned',
     a.credits_cost   = row.credits_cost,
+    a.rank_score     = row.rank_score,
+    a.rank_reason    = row.rank_reason,
     a.assigned_at    = toString(datetime()),
     a.viewed_at      = null,
     a.contacted_at   = null,
@@ -168,7 +170,11 @@ class DistributionEngine:
         """
         For each lead, find all eligible sellers and build assignment rows.
         Respects exclusivity (one seller per lead) and capacity limits.
+        Uses SellerRankingEngine for 6-dimensional seller prioritisation.
         """
+        from app.engines.seller_ranking_engine import SellerRankingEngine
+        ranker = SellerRankingEngine(self.neo, self.settings)
+
         # Mutable capacity tracker keyed by seller_id
         capacity = {s['seller_id']: s['max_leads_per_day'] - s['leads_today']
                     for s in sellers}
@@ -186,13 +192,16 @@ class DistributionEngine:
             priority     = lead.get('priority', 'low')
             cost         = CREDIT_COST.get(priority, 0)
 
+            # Rank sellers for this lead using 6-dimensional scoring
+            ranked_sellers = ranker.rank_sellers_for_lead(lead, sellers)
+
             lead_assigned = False
-            for seller in sellers:
+            for seller in ranked_sellers:
                 sid = seller['seller_id']
 
                 if capacity.get(sid, 0) <= 0:
                     continue
-                if seller['credits_available'] < cost:
+                if seller_map[sid]['credits_available'] < cost:
                     continue
 
                 chapter_match  = (not seller['hs_chapters']
@@ -217,6 +226,8 @@ class DistributionEngine:
                     'lead_id':      lead_id,
                     'match_reason': ','.join(reason),
                     'credits_cost': cost,
+                    'rank_score':   seller.get('rank_score', 0),
+                    'rank_reason':  seller.get('rank_reason', ''),
                 })
 
                 capacity[sid] = capacity.get(sid, 0) - 1
