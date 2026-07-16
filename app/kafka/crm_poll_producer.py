@@ -1,19 +1,21 @@
 """
 CRMPollProducer — replaces Debezium CDC when REPLICATION CLIENT is unavailable.
 
-Polls 11 CRM / goglo_staging tables every 30 seconds via plain SELECT.
+Polls 19 CRM / goglo_staging tables every 30 seconds via plain SELECT.
 Uses auto-increment id watermarks stored in a JSON file to detect new rows.
 Publishes raw row JSON to the appropriate Kafka topics.
 
 READ-ONLY: only SELECT queries against the live CRM MySQL tunnel (localhost:3307).
 
 Topics published:
-  crm.rfq_submitted   ← crm.rfqs, goglo_staging.enquiries
-  crm.lead_updates    ← crm.crm_leads, crm.lead_master
+  crm.rfq_submitted   ← crm.rfqs, crm.quotation, goglo_staging.enquiries
+  crm.lead_updates    ← crm.crm_leads, crm.lead_master, crm.crm_emails,
+                         crm.auto_quote_email_events, crm.account_risk_flags,
+                         crm.deals, crm.account_identity
   crm.buyer_sessions  ← crm.page_visits, crm.scroll_depths, crm.session_engagements,
-                         crm.trade_relationship, goglo_staging.tracking_sessions,
-                         goglo_staging.tracking_page_views
-  crm.buyer_clicks    ← goglo_staging.tracking_click_events
+                         crm.trade_relationship, crm.page_event_trackings,
+                         goglo_staging.tracking_sessions, goglo_staging.tracking_page_views
+  crm.buyer_clicks    ← crm.click_tracking, goglo_staging.tracking_click_events
 
 Run via:
   python3 main.py kafka-poll --config config.yaml
@@ -39,17 +41,32 @@ BATCH_SIZE     = 500   # max rows per table per poll
 # wm_type: "int"  → watermark is an integer (auto-increment id), starts at 0
 #          "time" → watermark is an ISO timestamp string, starts at "1970-01-01 00:00:00"
 TABLE_MAP = [
-    ("crm",           "rfqs",                   "id",         "int",  "crm.rfq_submitted"),
-    ("crm",           "crm_leads",              "id",         "int",  "crm.lead_updates"),
-    ("crm",           "lead_master",            "created_at", "time", "crm.lead_updates"),
-    ("crm",           "trade_relationship",     "id",         "int",  "crm.buyer_sessions"),
-    ("crm",           "page_visits",            "id",         "int",  "crm.buyer_sessions"),
-    ("crm",           "scroll_depths",          "id",         "int",  "crm.buyer_sessions"),
-    ("crm",           "session_engagements",    "id",         "int",  "crm.buyer_sessions"),
-    ("goglo_staging", "tracking_sessions",      "id",         "int",  "crm.buyer_sessions"),
-    ("goglo_staging", "tracking_click_events",  "id",         "int",  "crm.buyer_clicks"),
-    ("goglo_staging", "tracking_page_views",    "id",         "int",  "crm.buyer_sessions"),
-    ("goglo_staging", "enquiries",              "id",         "int",  "crm.rfq_submitted"),
+    # ── RFQ / Quotation events ────────────────────────────────────────────────
+    ("crm",           "rfqs",                    "id",         "int",  "crm.rfq_submitted"),
+    ("crm",           "quotation",               "id",         "int",  "crm.rfq_submitted"),
+    ("goglo_staging", "enquiries",               "id",         "int",  "crm.rfq_submitted"),
+
+    # ── Lead / account updates ────────────────────────────────────────────────
+    ("crm",           "crm_leads",               "id",         "int",  "crm.lead_updates"),
+    ("crm",           "lead_master",             "created_at", "time", "crm.lead_updates"),
+    ("crm",           "crm_emails",              "id",         "int",  "crm.lead_updates"),
+    ("crm",           "auto_quote_email_events", "id",         "int",  "crm.lead_updates"),
+    ("crm",           "account_risk_flags",      "id",         "int",  "crm.lead_updates"),
+    ("crm",           "deals",                   "id",         "int",  "crm.lead_updates"),
+    ("crm",           "account_identity",        "created_at", "time", "crm.lead_updates"),
+
+    # ── Buyer session / page events ───────────────────────────────────────────
+    ("crm",           "trade_relationship",      "id",         "int",  "crm.buyer_sessions"),
+    ("crm",           "page_visits",             "id",         "int",  "crm.buyer_sessions"),
+    ("crm",           "scroll_depths",           "id",         "int",  "crm.buyer_sessions"),
+    ("crm",           "session_engagements",     "id",         "int",  "crm.buyer_sessions"),
+    ("crm",           "page_event_trackings",    "id",         "int",  "crm.buyer_sessions"),
+    ("goglo_staging", "tracking_sessions",       "id",         "int",  "crm.buyer_sessions"),
+    ("goglo_staging", "tracking_page_views",     "id",         "int",  "crm.buyer_sessions"),
+
+    # ── Click / intent signals ────────────────────────────────────────────────
+    ("crm",           "click_tracking",          "id",         "int",  "crm.buyer_clicks"),
+    ("goglo_staging", "tracking_click_events",   "id",         "int",  "crm.buyer_clicks"),
 ]
 
 

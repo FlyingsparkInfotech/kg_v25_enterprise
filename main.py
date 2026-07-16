@@ -240,16 +240,22 @@ def init_seller_schema(config: str = 'config.yaml'):
 @app.command('kafka-poll')
 def kafka_poll(config: str = 'config.yaml'):
     """
-    Start the CRM Polling Producer — polls 11 CRM/goglo_staging tables every 30 s
+    Start the CRM Polling Producer — polls 19 CRM/goglo_staging tables every 30 s
     and publishes new rows to Kafka topics.  Replaces Debezium when the MySQL user
     lacks REPLICATION CLIENT privilege.
 
-    Watermarks stored at /opt/kg_data/crm_poll_watermarks.json — delete this file
-    to re-publish all historical rows (full initial load).
+    Watermarks stored at /opt/.debug/kg_v25_enterprise/crm_poll_watermarks.json — delete
+    this file to re-publish all historical rows (full initial load).
 
     Runs indefinitely. Stop with CTRL+C or SIGTERM.
     Requires kafka.enabled=true in config.yaml.
     """
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s [%(name)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
     s = load_settings(config)
     if not getattr(s.kafka, 'enabled', False):
         banner('Kafka is disabled — set kafka.enabled=true in config.yaml to activate')
