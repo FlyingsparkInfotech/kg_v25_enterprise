@@ -1,0 +1,17 @@
+{
+  "name": "jdbc-sink-buyer-profiles",
+  "config": {
+    "connector.class": "io.confluent.connect.jdbc.JdbcSinkConnector",
+    "tasks.max": "1",
+    "topics": "kg.buyer_profiles",
+    "connection.url": "jdbc:mysql://100.113.122.58:3307/crm2?useSSL=false&allowPublicKeyRetrieval=true",
+    "connection.user": "root",
+    "connection.password": "REPLACE_WITH_CRM2_PASSWORD",
+    "table.name.format": "kg_buyer_profiles",
+    "insert.mode": "upsert",
+    "pk.mode": "record_value",
+    "pk.fields": "user_id",
+    "auto.create": "true",
+    "auto.evolve": "true"
+  }
+}

@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+*.pyd
+
+# Virtual environment
+kgvenv/
+venv/
+env/
+
+# Logs & runtime
+*.log
+logs_*.log
+*.pid
+nohup.out
+
+# Sensitive / runtime state
+crm_poll_watermarks.json
+config.yaml
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# Models (large binaries)
+*.pkl
+*.joblib
+*.h5
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+
+# macOS metadata
+._*
+.AppleDouble
+.LSOverride

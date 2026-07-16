@@ -1,0 +1,260 @@
+"""
+CRMPollProducer — replaces Debezium CDC when REPLICATION CLIENT is unavailable.
+
+Polls 11 CRM / goglo_staging tables every 30 seconds via plain SELECT.
+Uses auto-increment id watermarks stored in a JSON file to detect new rows.
+Publishes raw row JSON to the appropriate Kafka topics.
+
+READ-ONLY: only SELECT queries against the live CRM MySQL tunnel (localhost:3307).
+
+Topics published:
+  crm.rfq_submitted   ← crm.rfqs, goglo_staging.enquiries
+  crm.lead_updates    ← crm.crm_leads, crm.lead_master
+  crm.buyer_sessions  ← crm.page_visits, crm.scroll_depths, crm.session_engagements,
+                         crm.trade_relationship, goglo_staging.tracking_sessions,
+                         goglo_staging.tracking_page_views
+  crm.buyer_clicks    ← goglo_staging.tracking_click_events
+
+Run via:
+  python3 main.py kafka-poll --config config.yaml
+"""
+
+import json
+import logging
+import os
+import signal
+import time
+from datetime import datetime, timezone
+
+import pymysql
+import pymysql.cursors
+
+logger = logging.getLogger(__name__)
+
+WATERMARK_FILE = "/opt/.debug/kg_v25_enterprise/crm_poll_watermarks.json"
+POLL_INTERVAL  = 30    # seconds between full poll cycles
+BATCH_SIZE     = 500   # max rows per table per poll
+
+# (database, table, watermark_col, wm_type, kafka_topic)
+# wm_type: "int"  → watermark is an integer (auto-increment id), starts at 0
+#          "time" → watermark is an ISO timestamp string, starts at "1970-01-01 00:00:00"
+TABLE_MAP = [
+    ("crm",           "rfqs",                   "id",         "int",  "crm.rfq_submitted"),
+    ("crm",           "crm_leads",              "id",         "int",  "crm.lead_updates"),
+    ("crm",           "lead_master",            "created_at", "time", "crm.lead_updates"),
+    ("crm",           "trade_relationship",     "id",         "int",  "crm.buyer_sessions"),
+    ("crm",           "page_visits",            "id",         "int",  "crm.buyer_sessions"),
+    ("crm",           "scroll_depths",          "id",         "int",  "crm.buyer_sessions"),
+    ("crm",           "session_engagements",    "id",         "int",  "crm.buyer_sessions"),
+    ("goglo_staging", "tracking_sessions",      "id",         "int",  "crm.buyer_sessions"),
+    ("goglo_staging", "tracking_click_events",  "id",         "int",  "crm.buyer_clicks"),
+    ("goglo_staging", "tracking_page_views",    "id",         "int",  "crm.buyer_sessions"),
+    ("goglo_staging", "enquiries",              "id",         "int",  "crm.rfq_submitted"),
+]
+
+
+def _to_json_safe(v):
+    """Convert MySQL types that are not JSON-serialisable."""
+    if v is None:
+        return None
+    if hasattr(v, "isoformat"):      # datetime / date / time
+        return v.isoformat()
+    try:
+        from decimal import Decimal
+        if isinstance(v, Decimal):
+            return float(v)
+    except ImportError:
+        pass
+    return v
+
+
+class CRMPollProducer:
+
+    def __init__(self, settings):
+        self.settings  = settings
+        self._running  = True
+        self._producer = None
+        self._conn     = None
+        self._wm       = self._load_watermarks()
+
+        signal.signal(signal.SIGINT,  self._shutdown)
+        signal.signal(signal.SIGTERM, self._shutdown)
+
+    def _shutdown(self, *_):
+        logger.info("CRMPollProducer: shutdown signal received")
+        self._running = False
+
+    # ── Watermarks ────────────────────────────────────────────────────────────
+
+    def _load_watermarks(self) -> dict:
+        try:
+            with open(WATERMARK_FILE) as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_watermarks(self):
+        wm_dir = os.path.dirname(WATERMARK_FILE)
+        if wm_dir:
+            os.makedirs(wm_dir, exist_ok=True)
+        with open(WATERMARK_FILE, "w") as f:
+            json.dump(self._wm, f, indent=2, default=str)
+
+    def _get_wm(self, db: str, table: str, wm_type: str):
+        default = 0 if wm_type == "int" else "1970-01-01 00:00:00"
+        return self._wm.get(f"{db}.{table}", default)
+
+    def _set_wm(self, db: str, table: str, value):
+        self._wm[f"{db}.{table}"] = value
+
+    # ── MySQL connection ──────────────────────────────────────────────────────
+
+    def _get_conn(self):
+        if self._conn:
+            try:
+                self._conn.ping(reconnect=True)
+                return self._conn
+            except Exception:
+                self._conn = None
+
+        cfg = self.settings.mysql_crm
+        self._conn = pymysql.connect(
+            host=cfg.host,
+            port=cfg.port,
+            user=cfg.user,
+            password=cfg.password,
+            charset="utf8mb4",
+            connect_timeout=10,
+            read_timeout=30,
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+        logger.info(f"CRMPollProducer: connected to MySQL {cfg.host}:{cfg.port}")
+        return self._conn
+
+    def _close_conn(self):
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    # ── Kafka producer ────────────────────────────────────────────────────────
+
+    def _get_producer(self):
+        if self._producer:
+            return self._producer
+        from kafka import KafkaProducer
+        cfg = self.settings.kafka
+        self._producer = KafkaProducer(
+            bootstrap_servers=cfg.bootstrap_servers,
+            value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
+            key_serializer=lambda k: k.encode("utf-8") if k else None,
+            acks="all",
+            retries=3,
+            max_block_ms=10_000,
+        )
+        logger.info(f"CRMPollProducer: Kafka producer connected to {cfg.bootstrap_servers}")
+        return self._producer
+
+    # ── Poll one table ────────────────────────────────────────────────────────
+
+    def _poll_table(self, db: str, table: str, wm_col: str, wm_type: str, topic: str) -> int:
+        last_wm  = self._get_wm(db, table, wm_type)
+        conn     = self._get_conn()
+        new_wm   = last_wm
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT * FROM `{db}`.`{table}` "
+                f"WHERE `{wm_col}` > %s "
+                f"ORDER BY `{wm_col}` ASC "
+                f"LIMIT %s",
+                (last_wm, BATCH_SIZE),
+            )
+            rows = cur.fetchall()
+
+        if not rows:
+            return 0
+
+        producer  = self._get_producer()
+        published = 0
+        now_iso   = datetime.now(timezone.utc).isoformat()
+
+        for row in rows:
+            payload = {k: _to_json_safe(v) for k, v in row.items()}
+            payload["_source_table"] = f"{db}.{table}"
+            payload["_polled_at"]    = now_iso
+
+            # Compute new watermark value
+            wm_val = row.get(wm_col)
+            if wm_type == "int":
+                try:
+                    wm_val = int(wm_val or 0)
+                except (TypeError, ValueError):
+                    wm_val = 0
+                if wm_val > new_wm:
+                    new_wm = wm_val
+                key = f"{db}.{table}:{wm_val}"
+            else:
+                # datetime / timestamp
+                wm_str = wm_val.isoformat() if hasattr(wm_val, "isoformat") else str(wm_val or "")
+                if wm_str > str(new_wm):
+                    new_wm = wm_str
+                key = f"{db}.{table}:{wm_str}"
+
+            try:
+                producer.send(topic, key=key, value=payload)
+                published += 1
+            except Exception as e:
+                logger.warning(f"CRMPollProducer: send to {topic} failed: {e}")
+
+        try:
+            producer.flush(timeout=10)
+        except Exception as e:
+            logger.warning(f"CRMPollProducer: flush failed: {e}")
+
+        self._set_wm(db, table, new_wm)
+        self._save_watermarks()
+
+        logger.info(
+            f"CRMPollProducer: {db}.{table} → {topic}: "
+            f"{published}/{len(rows)} rows  (watermark={new_wm})"
+        )
+        return published
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
+    def run(self):
+        logger.info("CRMPollProducer: starting — poll interval=%ds, tables=%d", POLL_INTERVAL, len(TABLE_MAP))
+
+        while self._running:
+            cycle_total = 0
+            for (db, table, wm_col, wm_type, topic) in TABLE_MAP:
+                if not self._running:
+                    break
+                try:
+                    n = self._poll_table(db, table, wm_col, wm_type, topic)
+                    cycle_total += n
+                except Exception as e:
+                    logger.error(f"CRMPollProducer: error polling {db}.{table}: {e}")
+                    self._close_conn()   # force reconnect on next cycle
+
+            if cycle_total:
+                logger.info(f"CRMPollProducer: cycle complete — {cycle_total} rows published")
+
+            # Interruptible sleep
+            for _ in range(POLL_INTERVAL):
+                if not self._running:
+                    break
+                time.sleep(1)
+
+        # Graceful cleanup
+        if self._producer:
+            try:
+                self._producer.flush(timeout=5)
+                self._producer.close()
+            except Exception:
+                pass
+        self._close_conn()
+        logger.info("CRMPollProducer: stopped.")

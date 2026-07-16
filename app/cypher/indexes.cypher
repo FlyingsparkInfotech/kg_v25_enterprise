@@ -1,0 +1,14 @@
+CREATE INDEX signal_v25_stage_idx IF NOT EXISTS FOR (s:Signal) ON (s.v25_stage);
+CREATE INDEX signal_source_table_v25_idx IF NOT EXISTS FOR (s:Signal) ON (s.sourceTable);
+CREATE INDEX evidence_model_v25_idx IF NOT EXISTS FOR (e:Evidence) ON (e.scoring_model_version);
+CREATE INDEX lead_source_v25_idx IF NOT EXISTS FOR (l:Lead) ON (l.source);
+CREATE INDEX signal_identity_done_v25_idx IF NOT EXISTS FOR (s:Signal) ON (s.v25_identity_done);
+CREATE INDEX signal_evidence_done_v25_idx IF NOT EXISTS FOR (s:Signal) ON (s.v25_evidence_done);
+CREATE INDEX pageview_signal_created_v25_idx IF NOT EXISTS FOR (n:PageView) ON (n.v25_signal_created);
+CREATE INDEX rfq_signal_created_v25_idx IF NOT EXISTS FOR (n:RFQ) ON (n.v25_signal_created);
+CREATE INDEX lead_signal_created_v25_idx IF NOT EXISTS FOR (n:Lead) ON (n.v25_signal_created);
+CREATE INDEX meeting_signal_created_v25_idx IF NOT EXISTS FOR (n:Meeting) ON (n.v25_signal_created);
+CREATE INDEX deal_signal_created_v25_idx IF NOT EXISTS FOR (n:Deal) ON (n.v25_signal_created);
+CREATE INDEX fit_model_v25_idx IF NOT EXISTS FOR (fs:FitSuppression) ON (fs.scoring_model_version);
+CREATE INDEX lc_model_v25_idx IF NOT EXISTS FOR (lc:LeadClassification) ON (lc.scoring_model_version);
+CREATE INDEX lead_post_v25_idx IF NOT EXISTS FOR (l:Lead) ON (l.v25_post_processed);

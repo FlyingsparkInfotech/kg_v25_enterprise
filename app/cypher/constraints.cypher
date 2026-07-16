@@ -1,0 +1,9 @@
+CREATE CONSTRAINT source_registry_key IF NOT EXISTS FOR (n:SourceRegistry) REQUIRE n.source_key IS UNIQUE;
+CREATE CONSTRAINT raw_source_uid_v25 IF NOT EXISTS FOR (n:RawSource) REQUIRE n.raw_source_uid IS UNIQUE;
+CREATE CONSTRAINT signal_uid_v25 IF NOT EXISTS FOR (n:Signal) REQUIRE n.signal_uid IS UNIQUE;
+CREATE CONSTRAINT identity_hypothesis_id_v25 IF NOT EXISTS FOR (n:IdentityHypothesis) REQUIRE n.hypothesis_id IS UNIQUE;
+CREATE CONSTRAINT evidence_uid_v25 IF NOT EXISTS FOR (n:Evidence) REQUIRE n.evidence_uid IS UNIQUE;
+CREATE CONSTRAINT opportunity_hypothesis_id_v25 IF NOT EXISTS FOR (n:OpportunityHypothesis) REQUIRE n.hypothesis_id IS UNIQUE;
+CREATE CONSTRAINT fit_suppression_uid_v25 IF NOT EXISTS FOR (n:FitSuppression) REQUIRE n.fit_suppression_uid IS UNIQUE;
+CREATE CONSTRAINT lead_classification_uid_v25 IF NOT EXISTS FOR (n:LeadClassification) REQUIRE n.classification_uid IS UNIQUE;
+CREATE CONSTRAINT lead_uid_v25 IF NOT EXISTS FOR (n:Lead) REQUIRE n.lead_uid IS UNIQUE;

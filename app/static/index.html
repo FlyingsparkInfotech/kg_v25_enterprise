@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>GoGlo KG V25.2 — Lead Intelligence Dashboard</title>
+<style>
+  :root {
+    --bg:       #0d1117;
+    --surface:  #161b22;
+    --border:   #30363d;
+    --accent:   #58a6ff;
+    --green:    #3fb950;
+    --yellow:   #d29922;
+    --red:      #f85149;
+    --purple:   #bc8cff;
+    --text:     #c9d1d9;
+    --muted:    #8b949e;
+    --radius:   8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: var(--bg); color: var(--text); min-height: 100vh; }
+
+  /* ── Layout ── */
+  header { background: var(--surface); border-bottom: 1px solid var(--border);
+           padding: 14px 24px; display: flex; align-items: center; gap: 16px;
+           position: sticky; top: 0; z-index: 100; }
+  header h1 { font-size: 1.1rem; font-weight: 600; color: var(--accent); white-space: nowrap; }
+  header span { font-size: 0.75rem; color: var(--muted); margin-left: auto; white-space: nowrap; }
+  .badge { background: var(--green); color: #000; font-size: 0.65rem;
+           font-weight: 700; padding: 2px 8px; border-radius: 12px; flex-shrink: 0; }
+
+  nav { display: flex; gap: 2px; padding: 12px 24px 0; overflow-x: auto;
+        border-bottom: 1px solid var(--border); background: var(--surface);
+        position: sticky; top: 53px; z-index: 99; }
+  nav::-webkit-scrollbar { height: 0; }
+  nav button { background: none; border: none; color: var(--muted); padding: 8px 16px;
+               font-size: 0.85rem; cursor: pointer; border-bottom: 2px solid transparent;
+               border-radius: 4px 4px 0 0; transition: all .15s; white-space: nowrap; flex-shrink: 0; }
+  nav button:hover { color: var(--text); }
+  nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+  /* ── KPI Cards ── */
+  .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+             gap: 16px; margin-bottom: 24px; }
+  .kpi { background: var(--surface); border: 1px solid var(--border);
+         border-radius: var(--radius); padding: 18px 20px; }
+  .kpi .label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase;
+                letter-spacing: .05em; margin-bottom: 8px; }
+  .kpi .value { font-size: 1.9rem; font-weight: 700; line-height: 1; }
+  .kpi .sub   { font-size: 0.75rem; color: var(--muted); margin-top: 6px; }
+  .green { color: var(--green); }
+  .yellow { color: var(--yellow); }
+  .red { color: var(--red); }
+  .blue { color: var(--accent); }
+  .purple { color: var(--purple); }
+
+  /* ── Card + Table ── */
+  .card { background: var(--surface); border: 1px solid var(--border);
+          border-radius: var(--radius); margin-bottom: 24px; overflow: hidden; }
+  .card-header { padding: 14px 20px; border-bottom: 1px solid var(--border);
+                 display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .card-header h2 { font-size: 0.9rem; font-weight: 600; }
+  .card-header .controls { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+  /* Table scroll wrapper — fixes horizontal overflow */
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+  select, input[type=text], input[type=number] {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 5px 10px; border-radius: 4px; font-size: 0.8rem; }
+  select:focus, input:focus { outline: none; border-color: var(--accent); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; min-width: 600px; }
+  thead th { padding: 10px 16px; text-align: left; font-size: 0.72rem; color: var(--muted);
+             text-transform: uppercase; letter-spacing: .05em;
+             border-bottom: 1px solid var(--border);
+             position: sticky; top: 0; background: var(--surface); z-index: 10; }
+  tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
+  tbody tr:hover { background: rgba(88,166,255,.05); }
+  tbody td { padding: 10px 16px; vertical-align: middle; }
+  tbody tr:last-child { border-bottom: none; }
+
+  /* ── Chips ── */
+  .chip { display: inline-block; padding: 2px 8px; border-radius: 12px;
+          font-size: 0.7rem; font-weight: 600; white-space: nowrap; }
+  .chip-critical { background: rgba(248,81,73,.15);   color: var(--red); }
+  .chip-high     { background: rgba(210,153,34,.15);  color: var(--yellow); }
+  .chip-medium   { background: rgba(88,166,255,.15);  color: var(--accent); }
+  .chip-low      { background: rgba(139,148,158,.15); color: var(--muted); }
+  .chip-healthy  { background: rgba(63,185,80,.15);   color: var(--green); }
+  .chip-stressed { background: rgba(210,153,34,.15);  color: var(--yellow); }
+  .chip-dormant  { background: rgba(188,140,255,.15); color: var(--purple); }
+  .chip-churned  { background: rgba(248,81,73,.15);   color: var(--red); }
+
+  /* ── Progress bar ── */
+  .bar-wrap { background: var(--border); border-radius: 4px; height: 6px; width: 80px; flex-shrink: 0; }
+  .bar-fill  { height: 6px; border-radius: 4px; transition: width .3s; }
+
+  /* ── Skeleton ── */
+  .skeleton { background: linear-gradient(90deg, var(--surface) 25%, var(--border) 50%, var(--surface) 75%);
+              background-size: 200% 100%; animation: shimmer 1.5s infinite;
+              border-radius: 4px; height: 14px; }
+  @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+
+  /* ── Alert ── */
+  .alert { padding: 12px 16px; border-radius: var(--radius); font-size: 0.82rem; margin-bottom: 16px; }
+  .alert-info  { background: rgba(88,166,255,.1);  border: 1px solid rgba(88,166,255,.3); }
+  .alert-warn  { background: rgba(210,153,34,.1);  border: 1px solid rgba(210,153,34,.3); }
+  .alert-error { background: rgba(248,81,73,.1);   border: 1px solid rgba(248,81,73,.3); }
+
+  /* ── Tabs ── */
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+
+  /* ── Buttons ── */
+  .btn { padding: 6px 14px; border-radius: 4px; font-size: 0.8rem; font-weight: 500;
+         cursor: pointer; border: 1px solid var(--border); background: var(--surface);
+         color: var(--text); transition: all .15s; white-space: nowrap; }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-primary { background: var(--accent); color: #000; border-color: var(--accent); }
+  .btn-primary:hover { background: #79c0ff; border-color: #79c0ff; color: #000; }
+  .btn-dl { background: rgba(63,185,80,.15); color: var(--green); border-color: rgba(63,185,80,.3); }
+  .btn-dl:hover { background: rgba(63,185,80,.25); border-color: var(--green); }
+
+  /* ── Score ── */
+  .score-cell { display: flex; align-items: center; gap: 8px; }
+  .score-num  { font-weight: 600; width: 28px; font-size: 0.85rem; }
+
+  /* ── Empty / Spinner ── */
+  .empty { text-align: center; padding: 48px; color: var(--muted); }
+  .spin { display: inline-block; width: 14px; height: 14px;
+          border: 2px solid var(--border); border-top-color: var(--accent);
+          border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Responsive ── */
+  @media (max-width: 768px) {
+    .kpi-row { grid-template-columns: repeat(2, 1fr); }
+    main { padding: 16px; }
+    header h1 { font-size: 0.95rem; }
+    .card-header { padding: 12px 14px; }
+    .card-header .controls { margin-left: 0; width: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+    <circle cx="12" cy="12" r="10" stroke="#58a6ff" stroke-width="1.5"/>
+    <path d="M8 12h8M12 8v8" stroke="#58a6ff" stroke-width="1.5" stroke-linecap="round"/>
+  </svg>
+  <h1>GoGlo KG V25.2 — Lead Intelligence</h1>
+  <span class="badge" id="api-status">connecting…</span>
+  <span id="last-refresh">—</span>
+</header>
+
+<nav>
+  <button class="active" onclick="switchTab('overview', this)">Overview</button>
+  <button onclick="switchTab('leads', this)">Switch Leads</button>
+  <button onclick="switchTab('factory', this)">Factory Leads</button>
+  <button onclick="switchTab('sellers', this)">Sellers</button>
+  <button onclick="switchTab('conversions', this)">Conversions</button>
+</nav>
+
+<main>
+
+<!-- ══ OVERVIEW ══ -->
+<div class="tab-pane active" id="tab-overview">
+  <div class="kpi-row" id="kpi-row">
+    <div class="kpi"><div class="label">Total Leads</div><div class="value blue" id="kpi-total">—</div><div class="sub">switch + factory</div></div>
+    <div class="kpi"><div class="label">Urgent (HIGH)</div><div class="value red" id="kpi-urgent">—</div><div class="sub">act now</div></div>
+    <div class="kpi"><div class="label">Relationships</div><div class="value green" id="kpi-rels">—</div><div class="sub">monitored</div></div>
+    <div class="kpi"><div class="label">Stressed Buyers</div><div class="value yellow" id="kpi-stressed">—</div><div class="sub">at-risk accounts</div></div>
+    <div class="kpi"><div class="label">Sellers Active</div><div class="value purple" id="kpi-sellers">—</div><div class="sub">registered</div></div>
+  </div>
+  <div class="card">
+    <div class="card-header">
+      <h2>Top 10 Urgent Switch Leads</h2>
+      <div class="controls">
+        <button class="btn btn-dl" onclick="exportTable('urgent-tbody', ['Buyer','Supplier','HS','Health','Switch%','Score','Urgency'], 'urgent_leads')">⬇ Export CSV</button>
+        <button class="btn" onclick="loadOverview()">↻ Refresh</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Buyer</th><th>Supplier</th><th>HS</th>
+          <th>Health</th><th>Switch Prob</th><th>Score</th><th>Urgency</th>
+        </tr></thead>
+        <tbody id="urgent-tbody"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ══ SWITCH LEADS ══ -->
+<div class="tab-pane" id="tab-leads">
+  <div class="card">
+    <div class="card-header">
+      <h2>Switch Leads</h2>
+      <div class="controls">
+        <input type="number" id="min-score" value="0" min="0" max="100" style="width:80px" placeholder="Min score">
+        <select id="dedup-select">
+          <option value="false">All</option>
+          <option value="true">Deduplicated</option>
+        </select>
+        <input type="number" id="limit-input" value="50" min="1" max="200" style="width:70px" placeholder="Limit">
+        <button class="btn btn-primary" onclick="loadLeads()">Search</button>
+        <button class="btn btn-dl" onclick="exportTable('leads-tbody', ['Buyer','Supplier','HS Code','Health','Switch%','Score','Action','Urgency'], 'switch_leads')">⬇ Export CSV</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Buyer</th><th>Supplier (Recommended)</th><th>HS Code</th>
+          <th>Health</th><th>Switch Prob %</th><th>Score</th>
+          <th>Action</th><th>Urgency</th>
+        </tr></thead>
+        <tbody id="leads-tbody"><tr><td colspan="8" class="empty">Press Search to load leads</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ══ FACTORY LEADS ══ -->
+<div class="tab-pane" id="tab-factory">
+  <div class="card">
+    <div class="card-header">
+      <h2>Factory Leads (KG Pipeline)</h2>
+      <div class="controls">
+        <select id="factory-priority">
+          <option value="">All priorities</option>
+          <option value="critical">Critical</option>
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+        </select>
+        <button class="btn btn-primary" onclick="loadFactoryLeads()">Load</button>
+        <button class="btn btn-dl" onclick="exportTable('factory-tbody', ['Lead ID','Type','Grain','Stage','Score','Evidence','Identity Conf','Priority','Playbook'], 'factory_leads')">⬇ Export CSV</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Lead ID</th><th>Type</th><th>Grain</th>
+          <th>Stage</th><th>Score</th><th>Evidence</th>
+          <th>Identity Conf</th><th>Priority</th><th>Playbook</th>
+        </tr></thead>
+        <tbody id="factory-tbody"><tr><td colspan="9" class="empty">Press Load to fetch factory leads</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ══ SELLERS ══ -->
+<div class="tab-pane" id="tab-sellers">
+  <div id="seller-list-section">
+    <div class="card">
+      <div class="card-header">
+        <h2>Seller Accounts</h2>
+        <div class="controls">
+          <button class="btn btn-dl" onclick="exportTable('sellers-tbody', ['Seller ID','Name','Tier','Credits','Leads Today','Max/Day','Active'], 'sellers')">⬇ Export CSV</button>
+          <button class="btn btn-primary" onclick="loadSellers()">↻ Refresh</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Seller ID</th><th>Name</th><th>Tier</th>
+            <th>Credits</th><th>Leads Today</th><th>Max/Day</th><th>Active</th><th>Dashboard</th>
+          </tr></thead>
+          <tbody id="sellers-tbody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div id="seller-dashboard-section" style="display:none">
+    <div style="margin-bottom:16px">
+      <button class="btn" onclick="showSellerList()">← Back to Sellers</button>
+    </div>
+    <div class="kpi-row" id="seller-kpis"></div>
+    <div class="card">
+      <div class="card-header"><h2 id="seller-dashboard-title">Seller Dashboard</h2></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Lead Type</th><th>Total Assigned</th><th>Converted</th><th>Rejected</th><th>Conv Rate</th><th>Avg Score</th>
+          </tr></thead>
+          <tbody id="seller-perf-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <h2>Assigned Leads</h2>
+        <div class="controls">
+          <button class="btn btn-dl" onclick="exportTable('seller-leads-tbody', ['Lead Type','Priority','Score','HS Code','Status','Assigned','Playbook'], 'seller_leads')">⬇ Export CSV</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Lead Type</th><th>Priority</th><th>Score</th>
+            <th>HS Code</th><th>Status</th><th>Assigned</th><th>Playbook</th>
+          </tr></thead>
+          <tbody id="seller-leads-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ CONVERSIONS ══ -->
+<div class="tab-pane" id="tab-conversions">
+  <div class="card">
+    <div class="card-header">
+      <h2>Conversion Stats by Lead Type</h2>
+      <div class="controls">
+        <button class="btn btn-dl" onclick="exportTable('conversions-tbody', ['Lead Type','Conversions','Avg Days','Avg Score'], 'conversions')">⬇ Export CSV</button>
+        <button class="btn btn-primary" onclick="loadConversions()">↻ Refresh</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Lead Type</th><th>Conversions</th><th>Avg Days to Convert</th><th>Avg Score</th>
+        </tr></thead>
+        <tbody id="conversions-tbody"><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+</main>
+
+<script>
+const API = '';
+
+// ══ Tab routing ══════════════════════════════════════════════════════════════
+function switchTab(name, btn) {
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  if (btn) btn.classList.add('active');
+  if (name === 'overview')    loadOverview();
+  if (name === 'sellers')     loadSellers();
+  if (name === 'conversions') loadConversions();
+}
+
+// ══ CSV Export — downloads directly, no new window ═══════════════════════════
+function exportTable(tbodyId, headers, filename) {
+  const tbody = document.getElementById(tbodyId);
+  if (!tbody) return;
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+  if (!rows.length || rows[0].querySelector('.empty')) return;
+
+  const lines = [headers.join(',')];
+  rows.forEach(row => {
+    const cells = Array.from(row.querySelectorAll('td')).map(td => {
+      const text = td.innerText.replace(/\n/g, ' ').trim();
+      return '"' + text.replace(/"/g, '""') + '"';
+    });
+    lines.push(cells.join(','));
+  });
+
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = filename + '_' + new Date().toISOString().slice(0,10) + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// ══ API helpers ══════════════════════════════════════════════════════════════
+async function apiFetch(path, opts = {}) {
+  try {
+    const res = await fetch(API + path, opts);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.json();
+  } catch (e) {
+    console.error(path, e);
+    return null;
+  }
+}
+
+function setApiStatus(ok) {
+  const el = document.getElementById('api-status');
+  el.textContent = ok ? 'API LIVE' : 'API ERROR';
+  el.style.background = ok ? 'var(--green)' : 'var(--red)';
+}
+
+function ts() {
+  document.getElementById('last-refresh').textContent =
+    'Refreshed ' + new Date().toLocaleTimeString();
+}
+
+// ══ Overview ═════════════════════════════════════════════════════════════════
+async function loadOverview() {
+  const [summary, urgent, sellers] = await Promise.all([
+    apiFetch('/summary'),
+    apiFetch('/leads/top/urgent?limit=10&deduplicate=true'),
+    apiFetch('/sellers'),
+  ]);
+
+  if (summary) {
+    setApiStatus(true);
+    document.getElementById('kpi-total').textContent    = fmt(summary.total_leads ?? summary.total_switch_leads ?? '—');
+    document.getElementById('kpi-rels').textContent     = fmt(summary.total_relationships ?? '—');
+    document.getElementById('kpi-stressed').textContent = fmt(summary.stressed_buyers ?? '—');
+  } else {
+    setApiStatus(false);
+  }
+
+  if (urgent) {
+    document.getElementById('kpi-urgent').textContent = urgent.length;
+    renderUrgent(urgent);
+  }
+
+  if (sellers) {
+    document.getElementById('kpi-sellers').textContent =
+      sellers.filter(s => s.active !== false).length;
+  }
+  ts();
+}
+
+function renderUrgent(leads) {
+  const tb = document.getElementById('urgent-tbody');
+  if (!leads.length) { tb.innerHTML = '<tr><td colspan="7" class="empty">No urgent leads</td></tr>'; return; }
+  tb.innerHTML = leads.map(l => `
+    <tr>
+      <td><b>${esc(l.buyer_name || l.buyer_id || '—')}</b><br><small style="color:var(--muted)">${esc(l.buyer_country||'')}</small></td>
+      <td>${esc(l.recommended_supplier_name || l.supplier_name || '—')}</td>
+      <td title="${esc(l.hs_description||'')}">${esc(l.hs_code||'—')}</td>
+      <td><span class="chip chip-${l.health_status||'low'}">${esc(l.health_status||'—')}</span></td>
+      <td>${probBar(l.switch_probability)}</td>
+      <td>${scoreCell(l.final_score)}</td>
+      <td><span class="chip chip-${(l.urgency||'low').toLowerCase()}">${esc(l.urgency||'—')}</span></td>
+    </tr>
+  `).join('');
+}
+
+// ══ Switch Leads ═════════════════════════════════════════════════════════════
+async function loadLeads() {
+  const minScore = document.getElementById('min-score').value || 0;
+  const dedup    = document.getElementById('dedup-select').value;
+  const limit    = document.getElementById('limit-input').value || 50;
+  const tb = document.getElementById('leads-tbody');
+  tb.innerHTML = '<tr><td colspan="8"><span class="spin"></span> Loading…</td></tr>';
+
+  const data = await apiFetch(`/leads?min_score=${minScore}&deduplicate=${dedup}&limit=${limit}`);
+  if (!data)       { tb.innerHTML = '<tr><td colspan="8" class="empty">API error</td></tr>'; return; }
+  if (!data.length){ tb.innerHTML = '<tr><td colspan="8" class="empty">No leads found</td></tr>'; return; }
+
+  tb.innerHTML = data.map(l => `
+    <tr>
+      <td><b>${esc(l.buyer_name||l.buyer_id||'—')}</b><br><small style="color:var(--muted)">${esc(l.buyer_country||'')} ${esc(l.buyer_industry||'')}</small></td>
+      <td>${esc(l.recommended_supplier_name||l.supplier_name||'—')}</td>
+      <td title="${esc(l.hs_description||'')}">${esc(l.hs_code||'—')} <small style="color:var(--muted)">${esc((l.hs_description||'').slice(0,20))}</small></td>
+      <td><span class="chip chip-${l.health_status||'low'}">${esc(l.health_status||'—')}</span></td>
+      <td>${probBar(l.switch_probability)}</td>
+      <td>${scoreCell(l.final_score)}</td>
+      <td><small style="color:var(--muted)">${esc((l.action_steps||[])[0]||'—')}</small></td>
+      <td><span class="chip chip-${(l.urgency||'low').toLowerCase()}">${esc(l.urgency||'—')}</span></td>
+    </tr>
+  `).join('');
+  ts();
+}
+
+// ══ Factory Leads ════════════════════════════════════════════════════════════
+async function loadFactoryLeads() {
+  const priority = document.getElementById('factory-priority').value;
+  const tb = document.getElementById('factory-tbody');
+  tb.innerHTML = '<tr><td colspan="9"><span class="spin"></span> Loading…</td></tr>';
+
+  const data = await apiFetch('/leads?limit=100&min_score=0&deduplicate=false');
+  if (!data) { tb.innerHTML = '<tr><td colspan="9" class="empty">API error</td></tr>'; return; }
+
+  const filtered = priority ? data.filter(l => (l.priority||'').toLowerCase() === priority) : data;
+  if (!filtered.length) { tb.innerHTML = '<tr><td colspan="9" class="empty">No leads match</td></tr>'; return; }
+
+  tb.innerHTML = filtered.map(l => `
+    <tr>
+      <td style="font-family:monospace;font-size:0.72rem">${esc((l.lead_id||l.id||'—').slice(-12))}</td>
+      <td><span class="chip chip-${l.health_status||'low'}">${esc(l.lead_type||l.health_status||'switch_lead')}</span></td>
+      <td><small>${esc(l.lead_grain||'opportunity_lead')}</small></td>
+      <td><small>${esc(l.lead_stage||'—')}</small></td>
+      <td>${scoreCell(l.final_score)}</td>
+      <td>${scoreCell(l.evidence_strength||null)}</td>
+      <td>${probBar(l.identity_confidence||l.switch_probability)}</td>
+      <td><span class="chip chip-${(l.priority||'low').toLowerCase()}">${esc(l.priority||'—')}</span></td>
+      <td><small style="color:var(--muted)">${esc((l.playbook_tags||(l.action_steps||[])[0]||'—').toString().slice(0,40))}</small></td>
+    </tr>
+  `).join('');
+  ts();
+}
+
+// ══ Sellers ══════════════════════════════════════════════════════════════════
+function showSellerList() {
+  document.getElementById('seller-list-section').style.display = '';
+  document.getElementById('seller-dashboard-section').style.display = 'none';
+}
+
+async function loadSellers() {
+  const tb = document.getElementById('sellers-tbody');
+  tb.innerHTML = '<tr><td colspan="8"><span class="spin"></span> Loading…</td></tr>';
+  const data = await apiFetch('/sellers');
+  if (!data) { tb.innerHTML = '<tr><td colspan="8" class="empty">API error</td></tr>'; return; }
+  if (!data.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">No sellers registered</td></tr>'; return; }
+
+  tb.innerHTML = data.map(s => `
+    <tr>
+      <td style="font-family:monospace;font-size:0.78rem">${esc(s.seller_id)}</td>
+      <td><b>${esc(s.name||'—')}</b></td>
+      <td><span class="chip chip-${s.tier==='enterprise'?'critical':s.tier==='professional'?'high':'medium'}">${esc(s.tier||'basic')}</span></td>
+      <td>${fmt(s.credits_available)}</td>
+      <td>${fmt(s.leads_today||0)}</td>
+      <td>${fmt(s.max_leads_per_day||0)}</td>
+      <td>${s.active !== false ? '<span class="green">●</span> Yes' : '<span class="red">●</span> No'}</td>
+      <td><button class="btn" onclick="loadSellerDashboard('${esc(s.seller_id)}')">View</button></td>
+    </tr>
+  `).join('');
+  ts();
+}
+
+async function loadSellerDashboard(sellerId) {
+  document.getElementById('seller-list-section').style.display = 'none';
+  document.getElementById('seller-dashboard-section').style.display = '';
+  document.getElementById('seller-dashboard-title').textContent = 'Dashboard — ' + sellerId;
+
+  const [dash, leads] = await Promise.all([
+    apiFetch('/sellers/' + encodeURIComponent(sellerId) + '/dashboard'),
+    apiFetch('/sellers/' + encodeURIComponent(sellerId) + '/leads?page_size=50'),
+  ]);
+
+  if (dash) {
+    document.getElementById('seller-kpis').innerHTML = `
+      <div class="kpi"><div class="label">Assigned</div><div class="value blue">${fmt(dash.total_assigned)}</div><div class="sub">total leads</div></div>
+      <div class="kpi"><div class="label">Converted</div><div class="value green">${fmt(dash.converted)}</div><div class="sub">${dash.conversion_rate_pct||0}% rate</div></div>
+      <div class="kpi"><div class="label">Contacted</div><div class="value yellow">${fmt(dash.contacted)}</div><div class="sub">${dash.contact_rate_pct||0}% rate</div></div>
+      <div class="kpi"><div class="label">New (7d)</div><div class="value purple">${fmt(dash.new_last_7d)}</div><div class="sub">recent leads</div></div>
+      <div class="kpi"><div class="label">Credits</div><div class="value ${dash.credits_unlimited?'green':'blue'}">${dash.credits_unlimited?'∞':fmt(dash.credits_available)}</div><div class="sub">${esc(dash.tier||'basic')} tier</div></div>
+    `;
+    const perf = dash.performance_by_type || [];
+    document.getElementById('seller-perf-tbody').innerHTML = perf.length
+      ? perf.map(p => `<tr>
+          <td>${esc(p.lead_type)}</td><td>${fmt(p.total)}</td>
+          <td class="green">${fmt(p.converted)}</td>
+          <td class="red">${fmt(p.rejected)}</td>
+          <td>${p.conv_rate_pct||0}%</td>
+          <td>${fmt(Math.round(p.avg_score||0))}</td>
+        </tr>`).join('')
+      : '<tr><td colspan="6" class="empty">No performance data yet</td></tr>';
+  }
+
+  if (leads && leads.length) {
+    document.getElementById('seller-leads-tbody').innerHTML = leads.map(l => `
+      <tr>
+        <td><span class="chip chip-${l.assignment_status||'medium'}">${esc(l.lead_type||'—')}</span></td>
+        <td><span class="chip chip-${(l.priority||'low').toLowerCase()}">${esc(l.priority||'—')}</span></td>
+        <td>${scoreCell(l.score)}</td>
+        <td title="${esc(l.hs_description||'')}">${esc(l.hs_code||'—')}</td>
+        <td><span class="chip chip-${l.assignment_status==='converted'?'healthy':l.assignment_status==='rejected'?'churned':'medium'}">${esc(l.assignment_status||'assigned')}</span></td>
+        <td><small>${esc((l.assigned_at||'—').slice(0,10))}</small></td>
+        <td><small style="color:var(--muted)">${esc((l.action_steps||[])[0]||'—')}</small></td>
+      </tr>
+    `).join('');
+  } else {
+    document.getElementById('seller-leads-tbody').innerHTML =
+      '<tr><td colspan="7" class="empty">No leads assigned yet</td></tr>';
+  }
+}
+
+// ══ Conversions ══════════════════════════════════════════════════════════════
+async function loadConversions() {
+  const tb = document.getElementById('conversions-tbody');
+  tb.innerHTML = '<tr><td colspan="4"><span class="spin"></span></td></tr>';
+  const data = await apiFetch('/conversions/stats');
+  if (!data || !data.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">No conversions recorded yet</td></tr>'; return; }
+  tb.innerHTML = data.map(r => `
+    <tr>
+      <td>${esc(r.lead_type||'—')}</td>
+      <td class="green">${fmt(r.conversions)}</td>
+      <td>${r.avg_days ? Math.round(r.avg_days) + ' days' : '—'}</td>
+      <td>${scoreCell(r.avg_score)}</td>
+    </tr>
+  `).join('');
+  ts();
+}
+
+// ══ Helpers ═══════════════════════════════════════════════════════════════════
+function fmt(n) { if (n == null || n === '—') return '—'; return Number(n).toLocaleString(); }
+function esc(s) {
+  return String(s||'')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function probBar(val) {
+  if (val == null) return '—';
+  const pct = val > 1 ? Math.round(val) : Math.round(val * 100);
+  const col = pct >= 70 ? 'var(--red)' : pct >= 40 ? 'var(--yellow)' : 'var(--green)';
+  return `<div style="display:flex;align-items:center;gap:6px">
+    <div class="bar-wrap"><div class="bar-fill" style="width:${Math.min(pct,100)}%;background:${col}"></div></div>
+    <small>${pct}%</small>
+  </div>`;
+}
+
+function scoreCell(val) {
+  if (val == null) return '—';
+  const n = Math.round(Number(val));
+  const col = n >= 85 ? 'var(--red)' : n >= 70 ? 'var(--yellow)' : n >= 50 ? 'var(--accent)' : 'var(--muted)';
+  return `<div class="score-cell">
+    <span class="score-num" style="color:${col}">${n}</span>
+    <div class="bar-wrap"><div class="bar-fill" style="width:${Math.min(n,100)}%;background:${col}"></div></div>
+  </div>`;
+}
+
+// ══ Init ══════════════════════════════════════════════════════════════════════
+loadOverview();
+setInterval(loadOverview, 60000);
+</script>
+</body>
+</html>

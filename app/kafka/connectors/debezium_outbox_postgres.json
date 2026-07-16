@@ -1,0 +1,27 @@
+{
+  "name": "debezium-outbox-postgres",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "database.hostname": "3.108.111.17",
+    "database.port": "30002",
+    "database.user": "admin_user",
+    "database.password": "PowerCozmo23",
+    "database.dbname": "develop",
+    "topic.prefix": "kg_outbox",
+    "schema.include.list": "etl",
+    "table.include.list": "etl.kg_outbox",
+    "plugin.name": "pgoutput",
+    "publication.name": "kg_outbox_pub",
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.table.field.event.id": "event_id",
+    "transforms.outbox.table.field.event.key": "aggregate_id",
+    "transforms.outbox.table.field.event.type": "event_type",
+    "transforms.outbox.table.field.event.payload": "payload",
+    "transforms.outbox.route.topic.replacement": "kg.${routedByValue}",
+    "transforms.outbox.table.expand.json.payload": "true",
+    "snapshot.mode": "never",
+    "decimal.handling.mode": "string"
+  }
+}

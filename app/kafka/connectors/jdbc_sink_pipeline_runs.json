@@ -1,0 +1,17 @@
+{
+  "name": "jdbc-sink-pipeline-runs",
+  "config": {
+    "connector.class": "io.confluent.connect.jdbc.JdbcSinkConnector",
+    "tasks.max": "1",
+    "topics": "kg.pipeline_runs",
+    "connection.url": "jdbc:mysql://100.113.122.58:3307/crm2?useSSL=false&allowPublicKeyRetrieval=true",
+    "connection.user": "root",
+    "connection.password": "rootpass",
+    "table.name.format": "kg_pipeline_runs",
+    "insert.mode": "upsert",
+    "pk.mode": "record_value",
+    "pk.fields": "run_id",
+    "auto.create": "true",
+    "auto.evolve": "true"
+  }
+}

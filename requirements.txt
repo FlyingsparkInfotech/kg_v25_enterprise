@@ -1,0 +1,26 @@
+neo4j==5.28.1
+PyMySQL==1.1.1
+psycopg2-binary==2.9.10
+
+# Kafka integration — Outbox pattern + event streaming
+kafka-python==2.0.2
+pydantic==2.11.7
+PyYAML==6.0.2
+typer==0.15.4
+rich==13.9.4
+pandas==2.2.3
+openpyxl==3.1.5
+
+# Optional but recommended for run tracking
+mlflow==3.9.0
+
+# API server
+fastapi==0.115.0
+uvicorn==0.30.6
+
+# ML models for supplier switch lead detection
+xgboost==2.1.0
+shap==0.46.0
+scikit-learn==1.5.0
+joblib==1.4.2
+numpy==1.26.4

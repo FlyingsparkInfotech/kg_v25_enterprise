@@ -1,0 +1,21 @@
+{
+  "name": "jdbc-sink-switch-leads",
+  "config": {
+    "connector.class": "io.confluent.connect.jdbc.JdbcSinkConnector",
+    "tasks.max": "1",
+    "topics": "kg.switch_leads",
+    "connection.url": "jdbc:mysql://100.113.122.58:3307/crm2?useSSL=false&allowPublicKeyRetrieval=true",
+    "connection.user": "root",
+    "connection.password": "rootpass",
+    "table.name.format": "kg_switch_leads",
+    "insert.mode": "upsert",
+    "pk.mode": "record_value",
+    "pk.fields": "lead_id",
+    "fields.whitelist": "lead_id,buyer_name,buyer_org_id,buyer_country,buyer_industry,current_supplier_name,recommended_supplier_name,recommended_supplier_id,hs_code,final_lead_score,switch_probability,lead_priority,health_score,health_status,stress_reason,match_score,buyer_monthly_volume,contact_name,contact_title,contact_email,recommended_action,status,created_at,synced_at",
+    "auto.create": "true",
+    "auto.evolve": "true",
+    "transforms": "dropEventFields",
+    "transforms.dropEventFields.type": "org.apache.kafka.connect.transforms.ReplaceField$Value",
+    "transforms.dropEventFields.exclude": "event_type,event_time"
+  }
+}
