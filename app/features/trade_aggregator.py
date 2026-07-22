@@ -490,3 +490,117 @@ class TradeAggregator:
             MERGE (tr)-[:HAS_SNAPSHOT]->(snap)
             RETURN count(snap) AS c
         """, {'batch': batch})
+
+    # ── Streaming: single-shipment update ────────────────────────────────────
+
+    def process_single_shipment(self, payload: dict):
+        """
+        Process one shipment event from the crm.shipments Kafka topic.
+        Upserts the TradeRelationship and current-month RelationshipSnapshot,
+        then recomputes the 6-month baseline average.
+        Returns rel_id on success, None if required fields are missing.
+        """
+        # Map raw trademo_shipment_bl columns (or legacy names)
+        buyer_id      = str(payload.get('consignee_id')   or payload.get('buyer_id')      or '').strip()
+        buyer_name    = str(payload.get('consignee_name') or payload.get('buyer_name')    or '')
+        supplier_id   = str(payload.get('shipper_id')     or payload.get('supplier_id')   or '').strip()
+        supplier_name = str(payload.get('shipper_name')   or payload.get('supplier_name') or '')
+        quantity      = float(payload.get('quantity') or payload.get('weight') or 0)
+        date_raw      = str(payload.get('shipment_date') or payload.get('bl_date') or payload.get('date') or '')
+
+        # hs_code may be a JSON array (bigint[]) or a plain string
+        hs_raw = payload.get('hs_code') or ''
+        if isinstance(hs_raw, list):
+            hs_code = str(hs_raw[0]).strip() if hs_raw else ''
+        else:
+            hs_code = str(hs_raw).strip()
+
+        if not buyer_id or not supplier_id or not hs_code:
+            warn(f'process_single_shipment: missing required fields — '
+                 f'buyer={buyer_id!r} supplier={supplier_id!r} hs={hs_code!r}')
+            return None
+
+        date_dt    = _parse_date(date_raw) or datetime.now(timezone.utc)
+        year_month = date_dt.strftime('%Y-%m-01')
+        rel_id     = stable_id(buyer_id, supplier_id, hs_code)
+        now        = utc_now()
+
+        # Upsert TradeRelationship — advance last_shipment_date only if newer
+        self.neo.run("""
+            MERGE (tr:TradeRelationship {rel_id: $rel_id})
+            ON CREATE SET
+                tr.buyer_org_id               = $buyer_id,
+                tr.buyer_name                 = $buyer_name,
+                tr.supplier_org_id            = $supplier_id,
+                tr.supplier_name              = $supplier_name,
+                tr.hs_code                    = $hs_code,
+                tr.hs_chapter                 = $hs_chapter,
+                tr.total_shipments            = 1,
+                tr.relationship_age_months    = 1,
+                tr.baseline_avg_monthly_qty   = $quantity,
+                tr.baseline_avg_monthly_value = 0.0,
+                tr.last_shipment_date         = $ship_date,
+                tr.data_source                = 'shipment_bl_stream',
+                tr.health_status              = 'pending',
+                tr.updated_at                 = $now
+            ON MATCH SET
+                tr.total_shipments  = coalesce(tr.total_shipments, 0) + 1,
+                tr.last_shipment_date = CASE
+                    WHEN tr.last_shipment_date IS NULL OR tr.last_shipment_date < $ship_date
+                    THEN $ship_date ELSE tr.last_shipment_date END,
+                tr.updated_at       = $now
+        """, {
+            'rel_id': rel_id,
+            'buyer_id': buyer_id, 'buyer_name': buyer_name,
+            'supplier_id': supplier_id, 'supplier_name': supplier_name,
+            'hs_code': hs_code, 'hs_chapter': hs_code[:2],
+            'quantity': quantity,
+            'ship_date': date_dt.strftime('%Y-%m-%d'),
+            'now': now,
+        })
+
+        # Upsert RelationshipSnapshot — accumulate within the same month
+        snapshot_id = stable_id(rel_id, year_month)
+        self.neo.run("""
+            MATCH (tr:TradeRelationship {rel_id: $rel_id})
+            MERGE (snap:RelationshipSnapshot {snapshot_id: $snapshot_id})
+            ON CREATE SET
+                snap.rel_id         = $rel_id,
+                snap.year_month     = $year_month,
+                snap.shipment_count = 1,
+                snap.total_quantity = $quantity,
+                snap.total_value    = 0.0,
+                snap.qty_vs_baseline_pct = 0.0,
+                snap.created_at     = $now
+            ON MATCH SET
+                snap.shipment_count = coalesce(snap.shipment_count, 0) + 1,
+                snap.total_quantity = coalesce(snap.total_quantity, 0.0) + $quantity
+            MERGE (tr)-[:HAS_SNAPSHOT]->(snap)
+        """, {
+            'rel_id': rel_id, 'snapshot_id': snapshot_id,
+            'year_month': year_month, 'quantity': quantity, 'now': now,
+        })
+
+        # Recompute baseline (oldest 6 months) and qty_vs_baseline on every snapshot
+        self.neo.run("""
+            MATCH (tr:TradeRelationship {rel_id: $rel_id})-[:HAS_SNAPSHOT]->(snap)
+            WITH tr, snap ORDER BY snap.year_month ASC
+            WITH tr, collect(snap) AS all_snaps
+            WITH tr, all_snaps,
+                 [s IN all_snaps[..6] | coalesce(s.total_quantity, 0.0)] AS first6
+            WITH tr, all_snaps,
+                 CASE WHEN size(first6) > 0
+                      THEN reduce(s = 0.0, v IN first6 | s + v) / size(first6)
+                      ELSE 0.0 END AS baseline
+            SET tr.baseline_avg_monthly_qty = baseline
+            WITH tr, all_snaps, baseline
+            UNWIND all_snaps AS snap
+            SET snap.qty_vs_baseline_pct = CASE
+                WHEN baseline > 0
+                THEN round((coalesce(snap.total_quantity, 0.0) / baseline - 1.0) * 100, 2)
+                ELSE 0.0 END
+        """, {'rel_id': rel_id})
+
+        info(f'process_single_shipment: updated rel {rel_id} '
+             f'({buyer_id} → {supplier_id} HS={hs_code} month={year_month})')
+        return rel_id

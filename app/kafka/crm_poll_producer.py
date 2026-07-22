@@ -69,6 +69,14 @@ TABLE_MAP = [
     ("goglo_staging", "tracking_click_events",   "id",         "int",  "crm.buyer_clicks"),
 ]
 
+# Postgres (goglo_etl) tables polled for trade signal streaming.
+# schema, table, watermark_col, wm_type, kafka_topic
+PG_TABLE_MAP = [
+    ('raw', 'trademo_shipment_bl', 'bl_key', 'int', 'crm.shipments'),
+]
+PG_POLL_INTERVAL = 60   # seconds between Postgres poll cycles
+
+
 
 def _to_json_safe(v):
     """Convert MySQL types that are not JSON-serialisable."""
@@ -242,6 +250,109 @@ class CRMPollProducer:
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
+
+    # ── Postgres (Trademo) polling ────────────────────────────────────────────
+
+    def _get_pg_conn(self):
+        """Lazy-init psycopg2 connection to goglo_etl Postgres."""
+        if getattr(self, '_pg_conn', None):
+            try:
+                self._pg_conn.cursor().execute('SELECT 1')
+                return self._pg_conn
+            except Exception:
+                pass
+        import psycopg2, psycopg2.extras
+        pg_cfg = getattr(self.settings, 'postgres', None)
+        host     = getattr(pg_cfg, 'host',     'localhost')  if pg_cfg else 'localhost'
+        port     = getattr(pg_cfg, 'port',     5432)         if pg_cfg else 5432
+        dbname   = getattr(pg_cfg, 'database', 'goglo_etl')  if pg_cfg else 'goglo_etl'
+        user     = getattr(pg_cfg, 'user',     'etl_user')   if pg_cfg else 'etl_user'
+        password = getattr(pg_cfg, 'password', 'EtlCozmo@2026!') if pg_cfg else 'EtlCozmo@2026!'
+        self._pg_conn = psycopg2.connect(
+            host=host, port=port, dbname=dbname, user=user, password=password,
+            connect_timeout=10,
+        )
+        self._pg_conn.autocommit = True
+        logger.info(f'CRMPollProducer: connected to Postgres {host}:{port}/{dbname}')
+        return self._pg_conn
+
+    def _poll_pg_table(self, schema: str, table: str,
+                       wm_col: str, wm_type: str, topic: str) -> int:
+        """Poll one Postgres table, publish new rows to Kafka. Returns row count."""
+        last_wm  = self._get_wm(schema, table, wm_type)
+        now_iso  = datetime.utcnow().isoformat()
+        producer = self._get_producer()
+
+        try:
+            conn = self._get_pg_conn()
+            cur  = conn.cursor(cursor_factory=__import__('psycopg2.extras', fromlist=['RealDictCursor']).RealDictCursor)
+            if wm_type == 'int':
+                cur.execute(
+                    f'SELECT * FROM "{schema}"."{table}" WHERE "{wm_col}" > %s ORDER BY "{wm_col}" LIMIT %s',
+                    (int(last_wm), self.batch_size),
+                )
+            else:
+                cur.execute(
+                    f'SELECT * FROM "{schema}"."{table}" WHERE "{wm_col}" > %s ORDER BY "{wm_col}" LIMIT %s',
+                    (str(last_wm), self.batch_size),
+                )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.error(f'CRMPollProducer: Postgres poll {schema}.{table} failed: {e}')
+            self._pg_conn = None   # force reconnect next time
+            return 0
+
+        if not rows:
+            return 0
+
+        new_wm   = last_wm
+        sent     = 0
+        for row in rows:
+            payload = dict(row)
+            wm_val  = payload.get(wm_col)
+
+            # Serialize any non-JSON-native types
+            for k, v in list(payload.items()):
+                if hasattr(v, 'isoformat'):          # date/datetime
+                    payload[k] = v.isoformat()
+                elif isinstance(v, (list, set)):     # postgres arrays
+                    payload[k] = list(v)
+
+            payload['_source_table'] = f'{schema}.{table}'
+            payload['_polled_at']    = now_iso
+
+            key = f'{schema}.{table}:{wm_val}'
+            try:
+                producer.send(topic, key=key.encode(), value=payload)
+                sent += 1
+                if wm_type == 'int' and wm_val is not None:
+                    new_wm = max(int(new_wm or 0), int(wm_val))
+                elif wm_val is not None:
+                    new_wm = max(str(new_wm), str(wm_val))
+            except Exception as e:
+                logger.warning(f'CRMPollProducer: Postgres send to {topic} failed: {e}')
+
+        try:
+            producer.flush(timeout=10)
+        except Exception:
+            pass
+
+        self._set_wm(schema, table, new_wm)
+        self._save_wm()
+        logger.info(f'CRMPollProducer: {schema}.{table} → {topic}: {sent} new rows (wm={new_wm})')
+        return sent
+
+    def _run_pg_poll_cycle(self):
+        """Run one poll cycle over all Postgres tables."""
+        total = 0
+        for (schema, table, wm_col, wm_type, topic) in PG_TABLE_MAP:
+            try:
+                n = self._poll_pg_table(schema, table, wm_col, wm_type, topic)
+                total += n
+            except Exception as e:
+                logger.error(f'CRMPollProducer: error in Postgres poll {schema}.{table}: {e}')
+        return total
+
     def run(self):
         logger.info("CRMPollProducer: starting — poll interval=%ds, tables=%d", POLL_INTERVAL, len(TABLE_MAP))
 
@@ -259,6 +370,17 @@ class CRMPollProducer:
 
             if cycle_total:
                 logger.info(f"CRMPollProducer: cycle complete — {cycle_total} rows published")
+
+
+            # Postgres / Trademo poll (runs every PG_POLL_INTERVAL seconds)
+            import time as _time
+            _now_ts = _time.time()
+            if _now_ts - getattr(self, "_last_pg_poll", 0) >= PG_POLL_INTERVAL:
+                try:
+                    self._run_pg_poll_cycle()
+                except Exception as _e:
+                    logger.error(f"CRMPollProducer: Postgres poll cycle error: {_e}")
+                self._last_pg_poll = _time.time()
 
             # Interruptible sleep
             for _ in range(POLL_INTERVAL):
