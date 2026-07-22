@@ -966,12 +966,19 @@ class SwitchLeadEngine:
         """
         Streaming switch-lead detection for a single TradeRelationship.
         Called by KafkaEventConsumer.handle_shipment() after process_single_shipment().
-        Runs: rule-based stress -> score (rule fallback) -> Neo4j supplier match -> SwitchLead.
-        ML models skipped here (IsolationForest needs full dataset).
+
+        Once models are trained, uses the full ML pipeline:
+          - health_detector.pkl  → IsolationForest on snapshot DataFrame (1+ rows)
+          - switch_classifier.pkl → predict_proba on extracted features
+          - supplier_ranker.pkl   → rank alternative suppliers
+
+        Falls back to rule-based scoring on each model that is not yet trained.
         Returns True if a SwitchLead was created or updated.
         """
+        import pandas as pd
         from datetime import datetime, timezone
 
+        # ── Fetch relationship + all snapshots ────────────────────────────────
         rows = self.neo.run("""
             MATCH (tr:TradeRelationship {rel_id: $rel_id})
             OPTIONAL MATCH (tr)-[:HAS_SNAPSHOT]->(snap:RelationshipSnapshot)
@@ -985,10 +992,11 @@ class SwitchLeadEngine:
                    tr.supplier_name            AS supplier_name,
                    tr.buyer_monthly_volume     AS buyer_monthly_volume,
                    collect({
-                       year_month:     snap.year_month,
-                       shipment_count: snap.shipment_count,
-                       total_quantity: snap.total_quantity,
-                       qty_vs_baseline: snap.qty_vs_baseline_pct
+                       year_month:       snap.year_month,
+                       shipment_count:   snap.shipment_count,
+                       total_quantity:   snap.total_quantity,
+                       total_value:      snap.total_value,
+                       qty_vs_baseline:  snap.qty_vs_baseline_pct
                    }) AS snapshots
         """, {"rel_id": rel_id})
 
@@ -1002,7 +1010,14 @@ class SwitchLeadEngine:
         last_raw  = str(row.get("last_shipment_date") or "")
         baseline  = float(row.get("baseline_avg_qty") or 0)
         snapshots = [s for s in (row.get("snapshots") or []) if s.get("year_month")]
+        buyer_id    = str(row.get("buyer_org_id")    or "")
+        supplier_id = str(row.get("supplier_org_id") or "")
+        hs_code     = str(row.get("hs_code")         or "")
+        buyer_name  = str(row.get("buyer_name")      or "")
+        sup_name    = str(row.get("supplier_name")   or "")
+        buyer_vol   = float(row.get("buyer_monthly_volume") or baseline)
 
+        # ── days since last shipment (used by both rule and ML paths) ─────────
         days_silent = 0
         if last_raw:
             try:
@@ -1019,10 +1034,57 @@ class SwitchLeadEngine:
             except Exception:
                 pass
 
+        # ══ STAGE A: health / stress detection ═══════════════════════════════
+        #
+        # Try ML model (health_detector.pkl) first.
+        # Build the same DataFrame format used by detect_stress() batch method.
+        # IsolationForest inference works on any number of rows — 1 is fine.
+        #
+        health_status   = None
+        health_score    = None
+        anomaly_score   = None
+        trend_direction = None
+        detection_method = "rule_based"
+
+        if snapshots:
+            try:
+                detector = self.registry.load_health_detector()
+                df_rows  = []
+                for snap in snapshots:
+                    df_rows.append({
+                        "rel_id":             rel_id,
+                        "buyer_org_id":       buyer_id,
+                        "supplier_org_id":    supplier_id,
+                        "hs_code":            hs_code,
+                        "buyer_name":         buyer_name,
+                        "supplier_name":      sup_name,
+                        "baseline_avg_qty":   baseline,
+                        "last_shipment_date": last_raw,
+                        "year_month":         str(snap.get("year_month") or ""),
+                        "total_quantity":     float(snap.get("total_quantity") or 0),
+                        "total_value":        float(snap.get("total_value")    or 0),
+                        "shipment_count":     int(snap.get("shipment_count")   or 0),
+                        "qty_vs_baseline_pct": float(snap.get("qty_vs_baseline") or 0),
+                    })
+                df = pd.DataFrame(df_rows)
+                df["total_quantity"] = pd.to_numeric(df["total_quantity"], errors="coerce").fillna(0)
+                health_df = detector.predict(df)
+                if not health_df.empty:
+                    best = health_df.iloc[0]   # single rel → take first (only) result
+                    health_status   = best["health_status"]
+                    health_score    = float(best["health_score"])
+                    anomaly_score   = float(best["anomaly_score"])
+                    trend_direction = best["trend_direction"]
+                    detection_method = "ml_based"
+                    info(f"detect_stress_for_rel: ML health={health_status} score={health_score:.1f}")
+            except Exception as e:
+                warn(f"detect_stress_for_rel: ML health detection failed, using rules: {e}")
+
+        # Rule-based fallback (or cross-check) ─────────────────────────────────
+        has_history  = len(snapshots) > 0
         recent_snaps = sorted(snapshots, key=lambda s: s.get("year_month", ""), reverse=True)[:2]
         recent_qty   = sum(float(s.get("total_quantity") or 0) for s in recent_snaps)
         recent_count = sum(int(s.get("shipment_count")   or 0) for s in recent_snaps)
-        has_history  = len(snapshots) > 0
 
         vol_drop_pct = 0.0
         if baseline > 0 and recent_snaps:
@@ -1047,33 +1109,92 @@ class SwitchLeadEngine:
         else:
             rule_status = "healthy";   rule_score = 10; rule_reason = "no_stress_signals"
 
-        self.neo.run("""
-            MATCH (tr:TradeRelationship {rel_id: $rel_id})
-            SET tr.rule_health_status = $status,
-                tr.rule_stress_score  = $score,
-                tr.rule_stress_reason = $reason,
-                tr.rule_days_silent   = $days,
-                tr.rule_vol_drop_pct  = $vol_drop,
-                tr.rule_detected_at   = $now
-        """, {
-            "rel_id": rel_id, "status": rule_status, "score": rule_score,
-            "reason": rule_reason, "days": days_silent,
-            "vol_drop": round(vol_drop_pct * 100, 1), "now": now_str,
-        })
+        # Use ML result if available, otherwise use rules
+        if health_status is None:
+            health_status = rule_status
+            detection_method = "rule_based"
 
-        if rule_status in ("healthy", "irregular"):
-            info(f"detect_stress_for_rel: {rel_id} -> {rule_status}, no lead")
+        # Derive stress_reason from ML trend or fall back to rule reason
+        if detection_method == "ml_based":
+            if health_status == "churned":
+                stress_reason = "churned"
+            elif days_silent > 180:
+                stress_reason = "long_gap"
+            elif trend_direction == "declining":
+                stress_reason = "quantity_drop"
+            elif trend_direction == "collapsed":
+                stress_reason = "long_gap"
+            else:
+                stress_reason = rule_reason   # rule reason as tiebreak
+            ml_stress_score = round(100 - health_score, 1)
+        else:
+            stress_reason   = rule_reason
+            ml_stress_score = rule_score
+
+        # Write health scores to TradeRelationship
+        neo_set = {
+            "rel_id": rel_id, "status": rule_status,
+            "rule_score": rule_score, "reason": rule_reason,
+            "days": days_silent, "vol_drop": round(vol_drop_pct * 100, 1),
+            "now": now_str,
+        }
+        if detection_method == "ml_based":
+            self.neo.run("""
+                MATCH (tr:TradeRelationship {rel_id: $rel_id})
+                SET tr.health_status    = $ml_status,
+                    tr.health_score     = $ml_score,
+                    tr.anomaly_score    = $anomaly,
+                    tr.trend_direction  = $trend,
+                    tr.rule_health_status = $status,
+                    tr.rule_stress_score  = $rule_score,
+                    tr.rule_stress_reason = $reason,
+                    tr.rule_days_silent   = $days,
+                    tr.rule_vol_drop_pct  = $vol_drop,
+                    tr.rule_detected_at   = $now
+            """, {**neo_set,
+                  "ml_status": health_status,
+                  "ml_score": health_score,
+                  "anomaly": anomaly_score,
+                  "trend": trend_direction})
+        else:
+            self.neo.run("""
+                MATCH (tr:TradeRelationship {rel_id: $rel_id})
+                SET tr.rule_health_status = $status,
+                    tr.rule_stress_score  = $rule_score,
+                    tr.rule_stress_reason = $reason,
+                    tr.rule_days_silent   = $days,
+                    tr.rule_vol_drop_pct  = $vol_drop,
+                    tr.rule_detected_at   = $now
+            """, neo_set)
+
+        if health_status in ("healthy", "irregular"):
+            info(f"detect_stress_for_rel: {rel_id} -> {health_status} ({detection_method}), no lead")
             return False
 
-        buyer_id    = str(row.get("buyer_org_id")    or "")
-        supplier_id = str(row.get("supplier_org_id") or "")
-        hs_code     = str(row.get("hs_code")         or "")
-        buyer_name  = str(row.get("buyer_name")      or "")
-        sup_name    = str(row.get("supplier_name")   or "")
-        buyer_vol   = float(row.get("buyer_monthly_volume") or baseline)
+        # ══ STAGE B: switch probability scoring ══════════════════════════════
         opp_id      = stable_id(buyer_id, supplier_id, hs_code, "rule_opp")
-        switch_prob = round(min(0.95, (rule_score / 100) * 0.8), 4)
+        switch_prob = None
 
+        try:
+            classifier = self.registry.load_switch_classifier() if self.registry.models_exist() else None
+            if classifier is not None:
+                from app.features.feature_extractor import FeatureExtractor
+                fe   = FeatureExtractor(self.neo, self.settings)
+                feat = fe.extract_relationship_features()
+                if not feat.empty:
+                    feat_idx = feat.set_index(["buyer_org_id", "supplier_org_id", "hs_code"])
+                    key      = (buyer_id, supplier_id, hs_code)
+                    if key in feat_idx.index:
+                        row_feat    = feat_idx.loc[[key]]
+                        switch_prob = float(classifier.predict_proba(row_feat)[0])
+                        info(f"detect_stress_for_rel: ML switch_prob={switch_prob:.3f}")
+        except Exception as e:
+            warn(f"detect_stress_for_rel: ML switch_prob failed, using rule fallback: {e}")
+
+        if switch_prob is None:
+            switch_prob = round(min(0.95, (ml_stress_score / 100) * 0.8), 4)
+
+        # Upsert SupplierSwitchOpportunity
         self.neo.run("""
             MERGE (opp:SupplierSwitchOpportunity {opportunity_id: $opp_id})
             SET opp.buyer_org_id             = $buyer_id,
@@ -1081,11 +1202,11 @@ class SwitchLeadEngine:
                 opp.hs_code                  = $hs_code,
                 opp.existing_supplier_org_id = $supplier_id,
                 opp.existing_supplier_name   = $sup_name,
-                opp.stress_reason            = $reason,
-                opp.stress_score             = $score,
+                opp.stress_reason            = $stress_reason,
+                opp.stress_score             = $stress_score,
                 opp.switch_probability       = $switch_prob,
                 opp.buyer_monthly_volume     = $buyer_vol,
-                opp.detection_method         = 'streaming_rule',
+                opp.detection_method         = $det_method,
                 opp.status                   = 'open',
                 opp.first_detected_at        = $now
             WITH opp
@@ -1095,121 +1216,188 @@ class SwitchLeadEngine:
             "opp_id": opp_id, "rel_id": rel_id,
             "buyer_id": buyer_id, "buyer_name": buyer_name,
             "supplier_id": supplier_id, "sup_name": sup_name,
-            "hs_code": hs_code, "reason": rule_reason, "score": rule_score,
-            "switch_prob": switch_prob, "buyer_vol": buyer_vol, "now": now_str,
+            "hs_code": hs_code, "stress_reason": stress_reason,
+            "stress_score": ml_stress_score, "switch_prob": round(switch_prob, 4),
+            "buyer_vol": buyer_vol, "det_method": detection_method, "now": now_str,
         })
 
         threshold = float(self.settings.models.switch_prob_threshold)
         if switch_prob < threshold:
-            info(f"detect_stress_for_rel: {rel_id} prob {switch_prob} < threshold — opp saved, no lead yet")
+            info(f"detect_stress_for_rel: {rel_id} prob {switch_prob:.3f} < threshold — opp saved, no lead yet")
             return False
 
-        hs_chapter = hs_code[:2]
-        candidates = self.neo.run("""
-            MATCH (org:Organization)
-            WHERE org.orgId <> $supplier_id
-              AND (any(h IN coalesce(org.hs_codes_exported, []) WHERE toString(h) STARTS WITH $hs_chapter)
-                   OR any(h IN coalesce(org.hs_codes_exported, []) WHERE toString(h) = $hs_code))
-            RETURN org.orgId AS supplier_org_id,
-                   coalesce(org.name, org.zi_name, org.orgId) AS supplier_name,
-                   coalesce(org.active_buyer_count, 0) AS active_buyer_count,
-                   coalesce(org.zi_contact_count, 0) > 0 AS has_zi_contact
-            ORDER BY org.active_buyer_count DESC
-            LIMIT 5
-        """, {"supplier_id": supplier_id, "hs_code": hs_code, "hs_chapter": hs_chapter})
+        # ══ STAGE C: supplier matching ════════════════════════════════════════
+        buyer_country = ""
+        buyer_rows = self.neo.run(
+            "MATCH (o:Organization {orgId: $id}) RETURN coalesce(o.zi_country, o.country, '') AS c",
+            {"id": buyer_id}
+        )
+        if buyer_rows:
+            buyer_country = str(buyer_rows[0].get("c") or "")
 
         hs_display = _clean_hs(hs_code)
+        match_min  = float(self.settings.models.match_score_threshold)
 
-        if not candidates:
+        # Try ranker first, fall back to plain Neo4j
+        candidates_raw = None
+        match_score_default = 60.0
+        try:
+            ranker = self.registry.load_supplier_ranker()
+            from app.features.feature_extractor import FeatureExtractor
+            fe         = FeatureExtractor(self.neo, self.settings)
+            cand_df    = fe.extract_supplier_candidates(hs_code, supplier_id, buyer_country or None)
+            if not cand_df.empty:
+                cand_df["buyer_volume_ratio"] = (
+                    buyer_vol / cand_df["recent_export_volume"].replace(0, 1)
+                ).clip(0, 10)
+                raw_scores  = ranker.rank(cand_df)
+                scores_100  = ranker.score_to_100(raw_scores)
+                top_idx     = scores_100.argsort()[::-1][:5]
+                candidates_raw = []
+                for rank, idx in enumerate(top_idx, start=1):
+                    r      = cand_df.iloc[idx]
+                    mscore = float(scores_100[idx])
+                    if mscore < match_min and rank > 1:
+                        continue
+                    candidates_raw.append({
+                        "supplier_org_id":       str(r.get("supplier_org_id") or ""),
+                        "supplier_name":         str(r.get("supplier_name")   or ""),
+                        "match_score":           round(mscore, 1),
+                        "rank":                  rank,
+                        "active_buyer_count":    int(r.get("active_buyer_count") or 0),
+                        "exports_to_buyer_country": bool(r.get("exports_to_buyer_country")),
+                        "has_zi_contact":        bool(r.get("has_zi_contact")),
+                    })
+                if candidates_raw:
+                    info(f"detect_stress_for_rel: ranker found {len(candidates_raw)} candidates")
+        except Exception as e:
+            warn(f"detect_stress_for_rel: ranker failed, using Neo4j fallback: {e}")
+
+        if not candidates_raw:
+            # Neo4j fallback: match by HS chapter
+            hs_chapter = hs_code[:2]
+            neo_cands = self.neo.run("""
+                MATCH (org:Organization)
+                WHERE org.orgId <> $supplier_id
+                  AND (any(h IN coalesce(org.hs_codes_exported, []) WHERE toString(h) STARTS WITH $hs_chapter)
+                       OR any(h IN coalesce(org.hs_codes_exported, []) WHERE toString(h) = $hs_code))
+                RETURN org.orgId AS supplier_org_id,
+                       coalesce(org.name, org.zi_name, org.orgId) AS supplier_name,
+                       coalesce(org.active_buyer_count, 0)        AS active_buyer_count,
+                       coalesce(org.zi_contact_count, 0) > 0      AS has_zi_contact
+                ORDER BY org.active_buyer_count DESC
+                LIMIT 5
+            """, {"supplier_id": supplier_id, "hs_code": hs_code, "hs_chapter": hs_chapter})
+            if neo_cands:
+                candidates_raw = [{
+                    "supplier_org_id":       str(c.get("supplier_org_id") or ""),
+                    "supplier_name":         str(c.get("supplier_name")   or ""),
+                    "match_score":           match_score_default,
+                    "rank":                  i + 1,
+                    "active_buyer_count":    int(c.get("active_buyer_count") or 0),
+                    "exports_to_buyer_country": False,
+                    "has_zi_contact":        bool(c.get("has_zi_contact")),
+                } for i, c in enumerate(neo_cands)]
+
+        if not candidates_raw:
+            # No supplier found — sourcing-needed lead
             final_score   = round(min(100.0, (switch_prob * 40) + min(buyer_vol / 10000, 25) +
-                                    max(0.0, (100 - rule_score) * 0.35)), 1)
+                                    max(0.0, (100 - ml_stress_score) * 0.35)), 1)
             lead_priority = "critical" if final_score >= 80 else "high"
-            lead_data     = [{
+            self._publish_leads([{
                 "lead_id": stable_id(opp_id, "stream_unmatched"),
                 "opportunity_id": opp_id, "match_id": "",
                 "buyer_org_id": buyer_id, "buyer_name": buyer_name,
                 "candidate_supplier_org_id": "", "candidate_supplier_name": "[Sourcing Needed]",
-                "hs_code": hs_code, "stress_reason": rule_reason,
+                "hs_code": hs_code, "stress_reason": stress_reason,
                 "switch_probability": switch_prob, "match_score": 0.0,
                 "final_lead_score": final_score, "lead_priority": lead_priority,
                 "buyer_monthly_volume": buyer_vol,
                 "recommended_action": (
-                    f"URGENT - Relationship {rule_status.upper()}: "
+                    f"URGENT - Relationship {health_status.upper()}: "
                     f"{buyer_name} imports {hs_display} from {sup_name}. "
-                    f"Showing {rule_reason.replace('_', ' ')}. "
+                    f"Showing {stress_reason.replace('_', ' ')}. "
                     f"No alternative supplier matched - source via market intelligence. "
                     f"Switch probability: {switch_prob:.0%}."
                 ),
                 "contact_name": "", "contact_title": "", "contact_email": "",
-                "buyer_country": "", "buyer_industry": "",
+                "buyer_country": buyer_country, "buyer_industry": "",
                 "status": "sourcing_needed", "source": "switch_lead_engine_v1_streaming",
                 "created_at": now_str,
-            }]
-            self._publish_leads(lead_data)
-            ok(f"detect_stress_for_rel: unmatched SwitchLead for {rel_id} ({rule_status})")
+            }])
+            ok(f"detect_stress_for_rel: unmatched SwitchLead for {rel_id} ({health_status}, {detection_method})")
             return True
 
-        best         = candidates[0]
-        mscore       = 60.0
-        sup_org_id   = str(best.get("supplier_org_id") or "")
-        sup_name_new = str(best.get("supplier_name")   or "")
-        match_id     = stable_id(opp_id, sup_org_id)
-        final_score  = round(min(100.0, (switch_prob * 40) + (mscore * 0.35) +
-                                 min(buyer_vol / 10000, 25)), 1)
-        lead_priority = (
-            "critical" if final_score >= 80 else
-            "high"     if final_score >= 65 else
-            "medium"
-        )
+        # ── build leads for top candidates ────────────────────────────────────
+        lead_batch = []
+        for cand in candidates_raw[:1]:   # top match only for streaming
+            sup_org_id   = cand["supplier_org_id"]
+            sup_name_new = cand["supplier_name"]
+            mscore       = cand["match_score"]
+            match_id     = stable_id(opp_id, sup_org_id)
+            final_score  = round(min(100.0, (switch_prob * 40) + (mscore * 0.35) +
+                                     min(buyer_vol / 10000, 25)), 1)
+            lead_priority = (
+                "critical" if final_score >= 80 else
+                "high"     if final_score >= 65 else
+                "medium"
+            )
+            country_note = " Already ships to buyer country." if cand.get("exports_to_buyer_country") else ""
+            active_note  = f" {cand['active_buyer_count']} active buyers." if cand.get("active_buyer_count") else ""
 
-        self.neo.run("""
-            MERGE (sm:SupplierMatch {match_id: $match_id})
-            SET sm.opportunity_id            = $opp_id,
-                sm.candidate_supplier_org_id = $sup_org_id,
-                sm.candidate_supplier_name   = $sup_name,
-                sm.hs_code_match_type        = 'streaming',
-                sm.match_score               = $mscore,
-                sm.rank                      = 1,
-                sm.active_buyer_count        = $active_buyers,
-                sm.has_zi_contact            = $has_zi,
-                sm.created_at                = $now
-            WITH sm
-            MATCH (opp:SupplierSwitchOpportunity {opportunity_id: $opp_id})
-            MERGE (opp)-[:HAS_MATCH]->(sm)
-        """, {
-            "match_id": match_id, "opp_id": opp_id,
-            "sup_org_id": sup_org_id, "sup_name": sup_name_new,
-            "mscore": mscore,
-            "active_buyers": int(best.get("active_buyer_count") or 0),
-            "has_zi": bool(best.get("has_zi_contact")),
-            "now": now_str,
-        })
+            self.neo.run("""
+                MERGE (sm:SupplierMatch {match_id: $match_id})
+                SET sm.opportunity_id            = $opp_id,
+                    sm.candidate_supplier_org_id = $sup_org_id,
+                    sm.candidate_supplier_name   = $sup_name,
+                    sm.hs_code_match_type        = $match_type,
+                    sm.match_score               = $mscore,
+                    sm.rank                      = $rank,
+                    sm.active_buyer_count        = $active_buyers,
+                    sm.exports_to_buyer_country  = $to_country,
+                    sm.has_zi_contact            = $has_zi,
+                    sm.created_at                = $now
+                WITH sm
+                MATCH (opp:SupplierSwitchOpportunity {opportunity_id: $opp_id})
+                MERGE (opp)-[:HAS_MATCH]->(sm)
+            """, {
+                "match_id": match_id, "opp_id": opp_id,
+                "sup_org_id": sup_org_id, "sup_name": sup_name_new,
+                "match_type": "ranker" if detection_method == "ml_based" else "streaming",
+                "mscore": mscore, "rank": cand["rank"],
+                "active_buyers": cand["active_buyer_count"],
+                "to_country": cand.get("exports_to_buyer_country", False),
+                "has_zi": cand.get("has_zi_contact", False),
+                "now": now_str,
+            })
 
-        lead_data = [{
-            "lead_id": stable_id(match_id, "switch_lead"),
-            "opportunity_id": opp_id, "match_id": match_id,
-            "buyer_org_id": buyer_id, "buyer_name": buyer_name,
-            "candidate_supplier_org_id": sup_org_id,
-            "candidate_supplier_name": sup_name_new,
-            "hs_code": hs_code, "stress_reason": rule_reason,
-            "switch_probability": switch_prob, "match_score": mscore,
-            "final_lead_score": final_score, "lead_priority": lead_priority,
-            "buyer_monthly_volume": buyer_vol,
-            "recommended_action": (
-                f"Buyer: {buyer_name} imports {hs_display} from {sup_name}. "
-                f"Relationship showing {rule_reason.replace('_', ' ')}. "
-                f"Switch probability: {switch_prob:.0%}. "
-                f"Recommended supplier: {sup_name_new}."
-            ),
-            "contact_name": "", "contact_title": "", "contact_email": "",
-            "buyer_country": "", "buyer_industry": "",
-            "status": "new", "source": "switch_lead_engine_v1_streaming",
-            "created_at": now_str,
-        }]
-        self._publish_leads(lead_data)
+            lead_batch.append({
+                "lead_id": stable_id(match_id, "switch_lead"),
+                "opportunity_id": opp_id, "match_id": match_id,
+                "buyer_org_id": buyer_id, "buyer_name": buyer_name,
+                "candidate_supplier_org_id": sup_org_id,
+                "candidate_supplier_name": sup_name_new,
+                "hs_code": hs_code, "stress_reason": stress_reason,
+                "switch_probability": switch_prob, "match_score": mscore,
+                "final_lead_score": final_score, "lead_priority": lead_priority,
+                "buyer_monthly_volume": buyer_vol,
+                "recommended_action": (
+                    f"Buyer: {buyer_name} imports {hs_display} from {sup_name}. "
+                    f"Relationship showing {stress_reason.replace('_', ' ')}. "
+                    f"Switch probability: {switch_prob:.0%}. "
+                    f"Recommended: {sup_name_new}.{country_note}{active_note}"
+                ),
+                "contact_name": "", "contact_title": "", "contact_email": "",
+                "buyer_country": buyer_country, "buyer_industry": "",
+                "status": "new", "source": "switch_lead_engine_v1_streaming",
+                "created_at": now_str,
+            })
+
+        self._publish_leads(lead_batch)
         ok(f"detect_stress_for_rel: SwitchLead for {rel_id} "
-           f"({rule_status}, prob={switch_prob:.2f}, supplier={sup_name_new})")
+           f"({health_status}, {detection_method}, prob={switch_prob:.2f})")
         return True
+
 
     def run_all(self) -> None:
         banner('SwitchLeadEngine: Running Full Switch Lead Pipeline')
