@@ -1,14 +1,13 @@
 """
 BuyerBehaviorAggregator — builds a complete behavioral picture of each GoGlo buyer.
 
-Sources (all from CRM2 / mysql_ui, port 3307):
-  tracking_sessions       → session count, devices, geographies
-  tracking_page_views     → pages viewed per session
-  tracking_click_events   → clicks on product/seller actions (high-intent signals)
-  tracking_scroll_events  → scroll depth (engagement depth)
-  enquiries               → buyer-to-seller product inquiries (20K+)
-  searched_keywords_list  → search terms
-  messages                → chat messages sent to sellers
+Sources:
+  CRM2 / mysql_ui:  tracking_sessions, tracking_page_views, tracking_click_events,
+                    tracking_scroll_events, enquiries, searched_keywords_list, messages
+  CRM / mysql_crm:  click_tracking (button_identity — commercial clicks)
+                    page_event_trackings (button_identity — PDP commercial actions)
+                    page_visits (page_name, utm_data — anonymous + paid-ad attribution)
+                    rfqs + rfq_items (RFQ draft/submitted leads)
 
 Output nodes (Neo4j):
   BuyerProfile            → one per buyer user_id, full aggregated behavioral data
@@ -19,10 +18,13 @@ Output nodes (Neo4j):
 Run via: python3 main.py build-buyer-profiles --config config.yaml
 """
 
+import logging
 from datetime import datetime
 from collections import defaultdict
 from app.core.logger import info, ok, warn, banner
 from app.db.neo4j_client import Neo4jClient
+
+logger = logging.getLogger(__name__)
 
 # ─── High-intent element weights ──────────────────────────────────────────────
 # These are button/section names from GoGlo product pages.
@@ -39,6 +41,36 @@ HIGH_INTENT = {
     "Company Profile":            1,
 }
 
+# ─── High-intent button_identity weights (crm.click_tracking + crm.page_event_trackings) ──
+# These are the actual CSS/HTML identifiers stored in the crm database.
+# Correction per Saif (Jul 2026): commercial actions live in click_tracking +
+# page_event_trackings.button_identity, NOT in page_visits.page_name.
+HIGH_INTENT_BUTTON_ID = {
+    # Quote / purchase intent (weight 3)
+    "getQuoteButton":                                   3,
+    "getquotebutton":                                   3,
+    # Contact / query intent (weight 2)
+    "contact-seller":                                   2,
+    "contact_seller":                                   2,
+    "send-query":                                       2,
+    "Chat with Seller":                                 2,
+    "add-to-contact":                                   2,
+    # Product research — strong (weight 2)
+    "catalog-download":                                 2,
+    # Product research — moderate (weight 1)
+    "company-profile":                                  1,
+    "Technical Specifications-product-specifciation-Tab": 1,
+    "Packaging Details-product-specifciation-Tab":      1,
+    "Certifications and Compliance-product-specifciation-Tab": 1,
+    "Shipping option-product-specifciation-Tab":        1,
+    "Warranty Information-product-specifciation-Tab":   1,
+    "Product Description-product-specifciation-Tab":    1,
+    "Return Policy-product-specifciation-Tab":          1,
+    "product-image-click":                              1,
+    "visit-store-link":                                 1,
+    "view-more-pdp":                                    1,
+}
+
 
 def _now() -> str:
     return datetime.utcnow().isoformat()
@@ -53,6 +85,19 @@ def _crm2_conn(settings):
         connect_timeout=10,
     )
 
+
+
+def _crm_conn(settings):
+    """Connect to the main CRM MySQL (mysql_crm config, port 3307 via tunnel).
+    This has click_tracking, page_event_trackings, page_visits, rfqs, etc.
+    """
+    import pymysql
+    return pymysql.connect(
+        host=settings.mysql_crm.host, port=settings.mysql_crm.port,
+        user=settings.mysql_crm.user, password=settings.mysql_crm.password,
+        database=settings.mysql_crm.database, charset="utf8mb4",
+        connect_timeout=10,
+    )
 
 def _fetch(cur, sql):
     cur.execute(sql)
@@ -152,8 +197,77 @@ def _pull_messages(cur):
     return []
 
 
+
+# ─── CRM MySQL pull functions (mysql_crm, scenarios D/H/A/C/M/F/G) ────────────
+
+def _pull_crm_clicks(cur):
+    """Pull commercial click events from crm.click_tracking.
+    Correction (Saif Jul 2026): commercial actions are in click_tracking.button_identity,
+    not page_visits.page_name.  Covers scenarios D (PDP Commercial Path) and H (Quote Request).
+    """
+    return _fetch(cur, """
+        SELECT ct.id, ct.user_id, ct.session_id,
+               ct.button_identity, ct.page_url,
+               ct.utm_source, ct.fingerprint,
+               ct.created_at
+        FROM click_tracking ct
+        WHERE ct.user_id IS NOT NULL AND ct.user_id <> ''
+          AND ct.button_identity IS NOT NULL AND ct.button_identity <> ''
+    """)
+
+
+def _pull_crm_page_events(cur):
+    """Pull commercial action events from crm.page_event_trackings.
+    Covers scenarios D (PDP Commercial Path), H (Quote Request Send Quote Click).
+    Has seller_id, product_id, category_id context alongside button_identity.
+    """
+    return _fetch(cur, """
+        SELECT pet.id, pet.user_id, pet.session_id,
+               pet.button_identity, pet.page_name, pet.page_url,
+               pet.seller_id, pet.product_id, pet.category_id,
+               pet.utm_source, pet.created_at
+        FROM page_event_trackings pet
+        WHERE pet.user_id IS NOT NULL AND pet.user_id <> ''
+          AND pet.button_identity IS NOT NULL AND pet.button_identity <> ''
+    """)
+
+
+def _pull_page_visits(cur):
+    """Pull page visit records from crm.page_visits.
+    Covers scenarios A (anonymous), C (category research), M (paid ads via utm_data).
+    page_name values: home, plp, pdp, category, etc.
+    utm_data is JSON with paid campaign attribution.
+    """
+    return _fetch(cur, """
+        SELECT pv.id, pv.user_id, pv.session_id, pv.fingerprint,
+               pv.page_name, pv.page_url,
+               pv.seller_id, pv.product_id, pv.category_id,
+               pv.utm_data, pv.max_scrol_depth,
+               pv.no_of_element_clicks, pv.stay_on_page,
+               pv.created_at
+        FROM page_visits pv
+        WHERE pv.created_at IS NOT NULL
+    """)
+
+
+def _pull_rfqs(cur):
+    """Pull RFQ records from crm.rfqs for scenarios F (RFQ Draft) and G (RFQ Submitted)."""
+    return _fetch(cur, """
+        SELECT r.id, r.user_id, r.rfq_number, r.status,
+               r.title, r.category, r.source_type,
+               r.organization_id, r.confidence_score,
+               r.created_at,
+               GROUP_CONCAT(ri.item_name SEPARATOR '|') AS item_names,
+               GROUP_CONCAT(ri.category SEPARATOR '|')  AS item_categories
+        FROM rfqs r
+        LEFT JOIN rfq_items ri ON ri.rfq_id = r.id
+        WHERE r.user_id IS NOT NULL
+        GROUP BY r.id
+    """)
+
 # ─── Step 2: Aggregate into per-user profiles ─────────────────────────────────
-def _build_profiles(sessions, clicks, scrolls, pageviews, enquiries, searches, messages):
+def _build_profiles(sessions, clicks, scrolls, pageviews, enquiries, searches, messages,
+                    crm_clicks=None, crm_page_events=None, rfqs=None):
     """Returns (profiles dict keyed by str(user_id), enq_user_ids set)."""
 
     def _empty():
@@ -271,6 +385,61 @@ def _build_profiles(sessions, clicks, scrolls, pageviews, enquiries, searches, m
             p = profiles[uid]
             p["user_id"] = uid
             p["messages_sent"] = int(m.get("msg_count") or 0)
+
+
+    # CRM click_tracking — button_identity-based commercial clicks (scenarios D, H)
+    for c in (crm_clicks or []):
+        uid = str(c.get("user_id") or "")
+        if not uid:
+            continue
+        p = profiles[uid]
+        p["user_id"] = uid
+        p["total_clicks"] += 1
+        btn = str(c.get("button_identity") or "").strip()
+        weight = HIGH_INTENT_BUTTON_ID.get(btn, 0)
+        if weight:
+            p["high_intent_score"] += weight
+            p["high_intent_detail"][btn] = p["high_intent_detail"].get(btn, 0) + 1
+        ts = str(c.get("created_at") or "")
+        if ts > p["last_activity_at"]:
+            p["last_activity_at"] = ts
+
+    # CRM page_event_trackings — button_identity with seller/product context (scenarios D, H)
+    for e in (crm_page_events or []):
+        uid = str(e.get("user_id") or "")
+        if not uid:
+            continue
+        p = profiles[uid]
+        p["user_id"] = uid
+        p["total_clicks"] += 1
+        btn = str(e.get("button_identity") or "").strip()
+        weight = HIGH_INTENT_BUTTON_ID.get(btn, 0)
+        if weight:
+            p["high_intent_score"] += weight
+            p["high_intent_detail"][btn] = p["high_intent_detail"].get(btn, 0) + 1
+        ts = str(e.get("created_at") or "")
+        if ts > p["last_activity_at"]:
+            p["last_activity_at"] = ts
+
+    # CRM rfqs — RFQ submitted/draft (scenarios F, G)
+    rfq_users: set[str] = set()
+    for r in (rfqs or []):
+        uid = str(r.get("user_id") or "")
+        if not uid:
+            continue
+        rfq_users.add(uid)
+        p = profiles[uid]
+        p["user_id"] = uid
+        status = str(r.get("status") or "draft")
+        # submitted RFQ is a strong signal — treat as an enquiry
+        if status in ("submitted", "active", "open"):
+            p["enquiries_sent"] += 1
+            if status == "submitted":
+                p["quote_requests"] += 1
+        ts = str(r.get("created_at") or "")
+        if ts > p["last_activity_at"]:
+            p["last_activity_at"] = ts
+    enq_users.update(rfq_users)
 
     return dict(profiles), enq_users
 
@@ -547,7 +716,9 @@ def record_click_signal(neo: Neo4jClient, payload: dict):
         return
 
     element_type = str(payload.get("element_type") or payload.get("element_id") or "")
-    weight       = HIGH_INTENT.get(element_type, 0)
+    button_id    = str(payload.get("button_identity") or "")
+    # Check both: display-name HIGH_INTENT (crm2) and button_identity HIGH_INTENT_BUTTON_ID (crm)
+    weight = HIGH_INTENT.get(element_type, 0) or HIGH_INTENT_BUTTON_ID.get(button_id, 0)
     polled_at    = payload.get("_polled_at") or _now()
 
     neo.run("""
@@ -581,8 +752,8 @@ def run(config_path: str = "config.yaml") -> dict:
 
     results = {}
     try:
-        # ── Pull raw data ──────────────────────────────────────────────────────
-        info("Step 1: Pulling behavioral data from CRM2 (tracking tables)...")
+        # ── Pull raw data from CRM2 (tracking_* legacy tables) ────────────────
+        info("Step 1a: Pulling behavioral data from CRM2 (tracking tables)...")
         conn = _crm2_conn(settings)
         try:
             cur = conn.cursor()
@@ -596,14 +767,31 @@ def run(config_path: str = "config.yaml") -> dict:
             cur.close()
         finally:
             conn.close()
-
         ok(f"  → sessions={len(sessions):,}  clicks={len(clicks):,}  scrolls={len(scrolls):,}")
         ok(f"  → pageviews={len(pageviews):,}  enquiries={len(enquiries):,}  searches={len(searches):,}  messages={len(messages):,}")
+
+        # ── Pull from CRM mysql_crm (click_tracking, page_event_trackings, rfqs) ──
+        crm_clicks = crm_page_events = rfqs_data = []
+        info("Step 1b: Pulling CRM commercial signals (click_tracking, page_event_trackings, rfqs)...")
+        try:
+            crm_conn = _crm_conn(settings)
+            try:
+                cur2 = crm_conn.cursor()
+                crm_clicks      = _pull_crm_clicks(cur2)
+                crm_page_events = _pull_crm_page_events(cur2)
+                rfqs_data       = _pull_rfqs(cur2)
+                cur2.close()
+            finally:
+                crm_conn.close()
+            ok(f"  → crm_clicks={len(crm_clicks):,}  crm_page_events={len(crm_page_events):,}  rfqs={len(rfqs_data):,}")
+        except Exception as _e:
+            warn(f"  CRM mysql_crm pull failed (non-fatal): {_e}")
 
         # ── Build per-user profiles ────────────────────────────────────────────
         info("Step 2: Aggregating into per-user behavioral profiles...")
         profiles, enq_users = _build_profiles(
-            sessions, clicks, scrolls, pageviews, enquiries, searches, messages
+            sessions, clicks, scrolls, pageviews, enquiries, searches, messages,
+            crm_clicks=crm_clicks, crm_page_events=crm_page_events, rfqs=rfqs_data
         )
         ok(f"  → {len(profiles):,} unique buyers profiled  |  {len(enq_users):,} with enquiries")
 

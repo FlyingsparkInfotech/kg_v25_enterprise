@@ -111,8 +111,31 @@ class KafkaEventConsumer:
             SwitchLeadEngine(self.neo, self.pg, self.settings).detect_stress_for_rel(rel_id)
 
     def handle_session(self, payload: dict):
-        """Browser session ended → update BuyerProfile."""
-        logger.info(f'handle_session: user={payload.get("user_id")} org={payload.get("org_id")}')
+        """Browser session ended → update BuyerProfile.
+        Routes page_event_trackings and page_visits with commercial button_identity
+        as click signals (correction per Saif: commercial actions live in
+        click_tracking + page_event_trackings, not page_visits.page_name).
+        """
+        source_table = payload.get("_source_table", "")
+        user_id = payload.get("user_id") or payload.get("userId") or ""
+
+        # page_event_trackings with a button_identity → treat as commercial click
+        if source_table == "crm.page_event_trackings" and payload.get("button_identity"):
+            logger.info(f'handle_session(page_event): user={user_id} btn={payload.get("button_identity")}')
+            from app.features.buyer_behavior_aggregator import record_click_signal
+            record_click_signal(self.neo, payload)
+            return
+
+        # page_visits with a commercial button_identity (element_name) → click signal
+        if source_table == "crm.page_visits" and payload.get("element_name"):
+            logger.info(f'handle_session(page_visit click): user={user_id} elem={payload.get("element_name")}')
+            from app.features.buyer_behavior_aggregator import record_click_signal
+            # map element_name → button_identity for weight lookup
+            payload.setdefault("button_identity", payload.get("element_name", ""))
+            record_click_signal(self.neo, payload)
+            # still fall through to update session count below
+
+        logger.info(f'handle_session: user={user_id} table={source_table}')
         from app.features.buyer_behavior_aggregator import update_single_profile
         update_single_profile(self.neo, self.pg, payload)
 
@@ -132,6 +155,10 @@ class KafkaEventConsumer:
             self._handle_risk_flag(payload)
         elif source_table in ("crm.crm_emails", "crm.auto_quote_email_events"):
             self._handle_email_event(payload)
+        elif source_table == "crm.account_identity":
+            self._handle_identity_resolved(payload)
+        elif source_table == "crm.lead_master":
+            self._handle_lead_master(payload)
         else:
             from app.features.lead_classifier import reclassify_lead
             reclassify_lead(self.neo, payload)
@@ -172,6 +199,38 @@ class KafkaEventConsumer:
               "deal_name": deal_name, "amount": amount,
               "now": datetime.now(timezone.utc).isoformat()})
         logger.info(f'_handle_deal: upserted Lead {src} as {lead_type}')
+
+
+    def _handle_identity_resolved(self, payload: dict):
+        """Identity resolved in CRM → annotate matching Lead/BuyerProfile nodes."""
+        account_uid = str(payload.get("account_uid") or payload.get("id") or "")
+        confidence  = float(payload.get("confidence_score") or 0)
+        org_name    = str(payload.get("organization_name") or "")
+        if not account_uid:
+            return
+        self.neo.run("""
+            MATCH (l:Lead)
+            WHERE l.account_uid = $uid OR l.source_ref CONTAINS $uid
+            SET l.identity_confidence = $conf,
+                l.org_name_resolved   = $org
+        """, {"uid": account_uid, "conf": confidence, "org": org_name})
+        logger.info(f'_handle_identity_resolved: account={account_uid} confidence={confidence}')
+
+    def _handle_lead_master(self, payload: dict):
+        """CRM lead_master updated → sync status/score to matching KG Lead node."""
+        lead_uid  = str(payload.get("lead_uid") or "")
+        status    = str(payload.get("status") or "")
+        score     = float(payload.get("score_final") or 0)
+        suppressed = bool(payload.get("is_suppressed") or False)
+        if not lead_uid:
+            return
+        self.neo.run("""
+            MATCH (l:Lead {lead_uid: $uid})
+            SET l.crm_status   = $status,
+                l.crm_score    = $score,
+                l.is_suppressed = $supp
+        """, {"uid": lead_uid, "status": status, "score": score, "supp": suppressed})
+        logger.info(f'_handle_lead_master: lead={lead_uid} status={status} score={score}')
 
     def _handle_risk_flag(self, payload: dict):
         """Account risk flag → suppress any matching leads from routing."""
