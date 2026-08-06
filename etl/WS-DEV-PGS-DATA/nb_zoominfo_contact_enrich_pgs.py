@@ -1,9 +1,9 @@
 import os
 #!/usr/bin/env python3
 # --------------------------------------------------------------------------------------
-# Trademo Relationship Health — PGS (Gold → PostgreSQL goglo_etl)
-# Target: raw.trademo_relationship_health  (localhost:5432/goglo_etl)
-# Anti-join on rh_key to prevent duplicates
+# ZoomInfo Contact Enrich — PGS (Gold → PostgreSQL goglo_etl)
+# Anti-join on contact_key against existing rows in zoominfo.contact_enrich
+# Target: zoominfo.contact_enrich  (localhost:5432/goglo_etl)
 # --------------------------------------------------------------------------------------
 
 from pyspark.sql import SparkSession
@@ -43,34 +43,25 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 PG_URL   = "jdbc:postgresql://localhost:5432/goglo_etl"
-PG_PROPS = {
-    "user"    : "etl_user",
-    "password": "EtlCozmo@2026!",
-    "driver"  : "org.postgresql.Driver"
-}
+PG_PROPS = {"user": "etl_user", "password": "EtlCozmo@2026!", "driver": "org.postgresql.Driver"}
+gold_path = "s3a://goglo-gold-layer/zoominfo/zoominfo-etl-contact-enrich-gold"
 
-gold_path = "s3a://goglo-gold-layer/trademo/trademo-etl-relationship-health-gold"
-
-logger.info("Starting Relationship Health Gold → PostgreSQL load")
+logger.info("Starting Contact Enrich Gold → PostgreSQL load")
 
 try:
     df_gold = spark.read.format("delta").load(gold_path)
 
     df_out = df_gold.select(
-        col("rh_key"),
+        col("contact_key"),
+        col("id"),
+        col("person_id"),
+        col("mobile_phone"),
+        col("phone"),
+        col("email"),
+        col("mobile_dnc"),
+        col("direct_dnc"),
+        col("company_id"),
         col("ingested_at"),
-        col("supplier_id"),
-        col("buyer_id"),
-        col("trade_from_date"),
-        col("trade_to_date"),
-        col("supplier_name"),
-        col("supplier_country"),
-        col("buyer_name"),
-        col("buyer_country"),
-        col("trade_relationship_health"),
-        col("total_shipment_count"),
-        col("shipment_trend"),
-        col("last_shipment_date"),
         col("created_on"),
         col("created_by"),
         col("modified_on"),
@@ -80,27 +71,27 @@ try:
     existing_keys = (
         spark.read.format("jdbc")
         .option("url", PG_URL)
-        .option("dbtable", "(SELECT rh_key FROM raw.trademo_relationship_health) AS t")
+        .option("dbtable", "(SELECT contact_key FROM zoominfo.contact_enrich) AS t")
         .option("user", PG_PROPS["user"])
         .option("password", PG_PROPS["password"])
         .option("driver", PG_PROPS["driver"])
         .load()
     )
 
-    new_rows  = df_out.join(existing_keys, on="rh_key", how="left_anti")
+    new_rows  = df_out.join(existing_keys, on="contact_key", how="left_anti")
     new_count = new_rows.count()
     logger.info(f"New rows to insert: {new_count}")
 
     if new_count > 0:
         new_rows.write.format("jdbc") \
             .option("url", PG_URL) \
-            .option("dbtable", "raw.trademo_relationship_health") \
+            .option("dbtable", "zoominfo.contact_enrich") \
             .option("user", PG_PROPS["user"]) \
             .option("password", PG_PROPS["password"]) \
             .option("driver", PG_PROPS["driver"]) \
             .mode("append") \
             .save()
-        logger.info(f"Inserted {new_count} rows into raw.trademo_relationship_health")
+        logger.info(f"Inserted {new_count} rows into zoominfo.contact_enrich")
     else:
         logger.info("No new rows — Postgres already up to date")
 
@@ -108,4 +99,4 @@ except Exception as e:
     logger.error(f"PGS loading failed: {e}", exc_info=True)
     raise
 
-logger.info("Relationship Health PGS load complete.")
+logger.info("Contact Enrich PGS load complete.")

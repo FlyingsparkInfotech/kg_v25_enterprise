@@ -18,6 +18,9 @@ POSTGRES_SIGNAL_TABLE_MAP = {
     'raw.trademo_company_ports_lading':     ('export_port_activity_detected',    'TradeShipmentSource'),
     'raw.trademo_company_ports_unlading':   ('import_port_activity_detected',    'TradeShipmentSource'),
     'raw.trademo_hs_classifier':            ('hs_classification_detected',       'TradeShipmentSource'),
+    'raw.trademo_relationship_health':       ('relationship_health_detected',     'TradeShipmentSource'),
+    'raw.trademo_company_profile':           ('company_profile_detected',         'TradeShipmentSource'),
+    'raw.trademo_shipment_search':           ('shipment_search_detected',         'TradeShipmentSource'),
     'raw.company_hs_code':                  ('company_hs_profile_detected',      'TradeShipmentSource'),
     'raw.company_products':                 ('company_product_profile_detected',  'TradeShipmentSource'),
 
