@@ -110,8 +110,26 @@ def build_trade_graph(config: str = 'config.yaml'):
         try:
             from app.engines.switch_lead_engine import SwitchLeadEngine
             e = SwitchLeadEngine(n, pg, s, tracker); e.build_trade_relationships(); e.enrich_with_zoominfo()
+            from app.features.trademo_relationship_enricher import TrademoRelationshipEnricher
+            from app.features.trademo_company_profile_enricher import TrademoCompanyProfileEnricher
+            TrademoRelationshipEnricher(n, pg, s).run()
+            TrademoCompanyProfileEnricher(n, pg, s).run()
         finally: pg.close(); n.close()
 
+
+
+@app.command('enrich-trademo')
+def enrich_trademo(config: str = 'config.yaml'):
+    """Enrich TradeRelationship + Organization nodes with Trademo health/risk scores."""
+    s = load_settings(config); tracker = MlflowTracker(s); banner('TRADEMO KG ENRICHMENT')
+    with tracker.run('enrich-trademo', run_params(s)):
+        n = neo(s); pg = PostgresClient(s.postgres.host, s.postgres.port, s.postgres.user, s.postgres.password, s.postgres.database)
+        try:
+            from app.features.trademo_relationship_enricher import TrademoRelationshipEnricher
+            from app.features.trademo_company_profile_enricher import TrademoCompanyProfileEnricher
+            TrademoRelationshipEnricher(n, pg, s).run()
+            TrademoCompanyProfileEnricher(n, pg, s).run()
+        finally: pg.close(); n.close()
 @app.command('detect-stress-rules')
 def detect_stress_rules(config: str = 'config.yaml'):
     """Run rule-based stress detection only (no ML model needed). Works with any data volume."""

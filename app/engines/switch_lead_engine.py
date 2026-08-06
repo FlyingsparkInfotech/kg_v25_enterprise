@@ -1403,6 +1403,13 @@ class SwitchLeadEngine:
         banner('SwitchLeadEngine: Running Full Switch Lead Pipeline')
         n_rels        = self.build_trade_relationships()
         n_orgs        = self.enrich_with_zoominfo()
+
+        # Stage 2B — Trademo health + company profile enrichment
+        from app.features.trademo_relationship_enricher import TrademoRelationshipEnricher
+        from app.features.trademo_company_profile_enricher import TrademoCompanyProfileEnricher
+        n_rh_enriched = TrademoRelationshipEnricher(self.neo, self.pg, self.settings).run().get('relationships_enriched', 0)
+        n_cp_enriched = TrademoCompanyProfileEnricher(self.neo, self.pg, self.settings).run().get('organizations_enriched', 0)
+
         n_rule_opps   = self.detect_stress_rules()   # Stage 3A — rule-based (always runs)
         n_ml_opps     = self.detect_stress()          # Stage 3B — ML-based (runs if model exists)
         n_scored      = self.score_switch_probability()
@@ -1411,6 +1418,7 @@ class SwitchLeadEngine:
         ok(
             f'SwitchLeadEngine complete — '
             f'relationships={n_rels}, orgs_enriched={n_orgs}, '
+            f'rh_enriched={n_rh_enriched}, cp_enriched={n_cp_enriched}, '
             f'rule_opportunities={n_rule_opps}, ml_opportunities={n_ml_opps}, '
             f'scored={n_scored}, matches={n_match}, leads={n_leads}'
         )
